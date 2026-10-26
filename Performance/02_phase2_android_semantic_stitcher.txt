@@ -1,0 +1,80 @@
+# PROMPT GIAI ĐOẠN 2: ANDROID SEMANTIC STITCHER, COROUTINE CONTEXT & HEAVY SINK CATALOG
+
+Tiếp tục dự án `android_perf_analyzer`. Hãy triển khai **Giai đoạn 2** để bổ sung ngữ nghĩa đặc thù của Android (UI Entry Points, Heavy Sinks, Coroutine Thread Switching, Dependency Injection Dagger/Hilt, và Reactive Streams). Viết code Python 3.11+ hoàn chỉnh và bộ unit test chạy được bằng `pytest`.
+
+## 1. Các file cần triển khai / cập nhật trong Giai đoạn 2
+1. `config/android_entrypoints.json`
+2. `config/android_sinks.json`
+3. `core/stitcher.py`
+4. Cập nhật `core/parser.py` và `core/summary_engine.py` để tích hợp `stitcher.py`
+5. `tests/test_phase2_android_semantics.py`
+
+## 2. Đặc tả Danh mục UI Entry Points (`config/android_entrypoints.json`)
+Tạo file cấu hình JSON định nghĩa các điểm khởi phát trên Main Thread và trọng số `entry_weight`:
+- **Nhóm Render & Scroll Critical (`entry_weight: 5.0`)**:
+  - Phương thức ghi đè: `onDraw`, `dispatchDraw`, `onMeasure`, `onLayout` (của `View` / `ViewGroup`)
+  - Phương thức RecyclerView: `onBindViewHolder`, `onCreateViewHolder`, `onScrolled`, `getItemViewType`
+  - Phương thức ListView/Adapter cũ: `getView`
+  - Jetpack Compose: Bất kỳ hàm Kotlin nào có annotation `@Composable`
+  - Animation / Choreographer: `doFrame`, `onAnimationUpdate`, `onPreDraw`
+- **Nhóm Lifecycle & Startup Critical (`entry_weight: 2.5`)**:
+  - `Application`: `onCreate`, `attachBaseContext`
+  - `Activity` / `Fragment`: `onCreate`, `onStart`, `onResume`, `onCreateView`, `onViewCreated`
+  - `BroadcastReceiver`: `onReceive`
+  - `Service`: `onStartCommand`, `onBind`
+- **Nhóm User Interaction (`entry_weight: 2.0`)**:
+  - `onClick`, `onTouch`, `onLongClick`, `onItemClick`, `onTextChanged`, `afterTextChanged`
+
+## 3. Đặc tả Từ điển Android Heavy Sinks (`config/android_sinks.json`)
+Định nghĩa danh sách các mẫu API đắt đỏ kèm `sink_cost` và `category`:
+1. **`BINDER_IPC` (`sink_cost: 80.0`)**:
+   - `PackageManager`: `getInstalledPackages`, `getInstalledApplications`, `getApplicationInfo`, `getPackageInfo`, `queryIntentActivities`, `queryIntentServices`, `resolveActivity`
+   - `ActivityManager`: `getRunningAppProcesses`, `getMemoryInfo`, `getRunningServices`
+   - `ConnectivityManager`: `getActiveNetworkInfo`, `getNetworkCapabilities`, `getAllNetworks`
+   - `ClipboardManager`: `getPrimaryClip`, `hasPrimaryClip`
+   - `Context`: `getSystemService` (khi bị gọi lặp bên trong vòng lặp)
+2. **`DISK_AND_DB_IO` (`sink_cost: 120.0`)**:
+   - `SharedPreferences`: `getSharedPreferences`, `Editor.commit`
+   - `SQLiteDatabase` / `Room` / `ContentResolver`: `rawQuery`, `query`, `insert`, `update`, `delete`, `execSQL`
+   - `File` / `InputStream` / `OutputStream`: `readText`, `readBytes`, `writeText`, `FileInputStream`, `FileOutputStream`, `exists`, `listFiles`
+   - `BitmapFactory`: `decodeFile`, `decodeResource`, `decodeStream`, `decodeByteArray`
+3. **`CPU_SERIALIZATION_AND_REGEX` (`sink_cost: 45.0`)**:
+   - `Gson.fromJson`, `Gson.toJson`, `Moshi.Adapter.fromJson`, `JSONObject`, `JSONArray`, `XmlPullParser`
+   - `Regex(...)`, `Pattern.compile(...)`, `String.matches(...)`, `String.replace(Regex, ...)`
+   - `Class.forName`, `Method.invoke`, `Field.get` (Reflection)
+4. **`SUBOPTIMAL_COLLECTION_IN_LOOP` (`sink_cost: 25.0` khi `local_loop_depth >= 1`)**:
+   - Gọi `.contains()`, `.indexOf()`, `.lastIndexOf()`, `.remove()` trên kiểu `List` / `ArrayList` bên trong một vòng lặp (dấu hiệu O(N^2)).
+   - Khởi tạo chuỗi hoặc nối chuỗi bằng toán tử `+` bên trong vòng lặp.
+
+## 4. Đặc tả Bộ Khâu nối Cạnh Ảo & Ngữ cảnh Luồng (`core/stitcher.py`)
+Triển khai class `AndroidSemanticStitcher` thực hiện 4 nhiệm vụ sau trên AST và Call Graph:
+
+1. **Phân tích Ngữ cảnh Luồng Coroutines & RxJava (Thread-Switch Pruning)**:
+   - Khi một lời gọi hàm nằm bên trong khối lambda của:
+     - `withContext(Dispatchers.IO)` hoặc `withContext(Dispatchers.Default)`
+     - `CoroutineScope(Dispatchers.IO).launch / async`
+     - `Thread { ... }`, `Executor.execute { ... }`, `AsyncTask.doInBackground`
+     -> Gán `edge_thread_context = ThreadContext.SWITCH_TO_BG` (cắt hoàn toàn sự lan truyền rủi ro lên Main Thread).
+   - **Quy tắc Bẫy Coroutine trên Main Thread**: Nếu hàm gọi `lifecycleScope.launch`, `viewModelScope.launch`, hoặc `MainScope().launch` mà **không** truyền `Dispatchers.IO` hay `Dispatchers.Default` vào tham số của `launch(...)`, mọi lời gọi hàm bên trong (bao gồm cả các hàm `suspend`) đều giữ nguyên `edge_thread_context = ThreadContext.UI_MAIN`.
+
+2. **Khâu nối Dependency Injection (Dagger / Hilt / Koin Interface Binding)**:
+   - Quét tất cả các class/interface để tìm:
+     - Các phương thức có annotation `@Binds` (VD: `@Binds abstract fun bindUserRepo(impl: UserRepoImpl): UserRepo`).
+     - Các phương thức `@Provides` trả về kiểu Interface nhưng khởi tạo `Impl` ở câu lệnh `return`.
+     - Các class `class FooImpl(...) : FooInterface` có annotation `@Inject constructor` hoặc `@Singleton`.
+   - Khi một hàm gọi `interfaceVar.doWork()`, tự động tạo cạnh ảo (`is_synthetic = True`) nối từ điểm gọi đó tới `FooImpl.doWork()` trong bảng `call_edges`.
+
+3. **Khâu nối Hàng đợi Main Looper (`View.post` / `Handler.post` / `runOnUiThread`)**:
+   - Nếu trong một hàm (kể cả đang ở Background Thread) xuất hiện lời gọi `view.post { ... }`, `view.postDelayed({ ... }, ...)`, `activity.runOnUiThread { ... }`, hoặc `mainHandler.post { ... }`:
+   - Đánh dấu khối lambda bên trong là một nhánh chuyển ngược về `UI_MAIN` và nối cạnh trực tiếp tới các hàm được gọi trong lambda đó.
+
+4. **Khâu nối Reactive Streams (`StateFlow` / `LiveData` Pub-Sub Bridge) & Phát hiện Tranh chấp Khóa (Lock Contention)**:
+   - Theo dõi các thuộc tính kiểu `MutableStateFlow<T>` / `StateFlow<T>` và `MutableLiveData<T>` / `LiveData<T>`. Khi một hàm ở UI gọi `.collect { item -> render(item) }` hoặc `.observe(owner) { item -> render(item) }`, tự động đánh dấu hàm `render(item)` tương đương một `UI_MAIN` Entry Point có `entry_weight = 2.5`.
+   - Quét toàn bộ khối `synchronized(lock)` hoặc phương thức `@Synchronized` / `synchronized`. Nếu cùng một khóa (cùng biến `lock` hoặc cùng `this` của một class Singleton) vừa bị chiếm giữ bởi một hàm thuộc nhánh `UI_MAIN`, vừa bị chiếm giữ bởi một hàm thuộc nhánh `WORKER_BG` có `propagated_total_cost >= 50.0` -> gắn cờ cảnh báo đặc biệt: `CROSS_THREAD_LOCK_CONTENTION (ANR Risk)`.
+
+## 5. Yêu cầu Kiểm thử (`tests/test_phase2_android_semantics.py`)
+Viết bộ unit test kiểm chứng:
+1. Một `ViewModel` gọi hàm `suspend fun loadUsers()` bên trong `viewModelScope.launch` mà không có `withContext(Dispatchers.IO)`, bên trong `loadUsers()` gọi `Gson.fromJson` trong vòng lặp -> Hệ thống phải bắt được lỗi Blocking Main Thread.
+2. Khi bọc phần thân của `loadUsers()` bằng `withContext(Dispatchers.IO)` -> Điểm `ux_risk_score` tại `viewModelScope.launch` lập tức giảm về mức an toàn (nhánh dưới đã được prune).
+3. Kiểm tra nối cạnh qua Interface: `OrderViewModel` gọi `orderRepository.calculateTax()`, hệ thống tự động nối xuyên qua interface `OrderRepository` tới `OrderRepositoryImpl.calculateTax()` và phát hiện lệnh gọi `SharedPreferences.Editor.commit()` bên trong đó.
+4. Kiểm tra phát hiện `CROSS_THREAD_LOCK_CONTENTION` khi cả Main Thread và Background Thread cùng `synchronized(cacheLock)` mà nhánh Background đang ghi file.

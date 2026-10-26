@@ -1,0 +1,51 @@
+# PROMPT GIAI ĐOẠN 4: INCREMENTAL GIT-DIFF ENGINE, SARIF 2.1.0 EXPORTER & PRODUCTION CLI
+
+Hoàn thiện dự án `android_perf_analyzer` với **Giai đoạn 4**. Hãy xây dựng bộ điều phối phân tích gia tăng theo Git Diff, bộ xuất chuẩn SARIF 2.1.0 (hiển thị luồng lỗi trực quan trên Android Studio / VS Code / GitHub PR) và giao diện dòng lệnh `cli.py`. Viết code Python 3.11+ hoàn chỉnh và bộ test tích hợp chạy được bằng `pytest`.
+
+## 1. Các file cần triển khai trong Giai đoạn 4
+1. `reporters/sarif_exporter.py`
+2. `reporters/markdown_reporter.py`
+3. `cli.py`
+4. `tests/test_phase4_end_to_end.py`
+
+## 2. Đặc tả Phân tích Gia tăng theo Git Diff (`cli.py` & `core/store.py`)
+Khi chạy lệnh `python -m android_perf_analyzer.cli diff-scan --base-ref main`:
+1. Gọi `git diff --name-only <base-ref>` để lấy danh sách các file `.java` và `.kt` vừa bị sửa đổi.
+2. Chỉ chạy Tree-sitter Parser trên các file bị sửa đổi đó.
+3. So sánh `ast_hash` mới của từng hàm trong file với `ast_hash` đang lưu trong bảng `function_summaries` của SQLite:
+   - Nếu `ast_hash` không đổi (chỉ sửa dòng trống hoặc comment ngoài hàm): bỏ qua.
+   - Nếu `ast_hash` thay đổi: cập nhật lại bản tóm tắt cục bộ của hàm đó và đưa `fqn` vào tập `dirty_functions`.
+4. Gọi `store.get_reverse_dependents(dirty_functions)` để lấy ra **Hình nón Phụ thuộc Ngược (Reverse Dependency Cone)** — tức là chỉ những hàm cha/tổ tiên có đường dẫn gọi xuống các hàm trong `dirty_functions`.
+5. Chỉ chạy lại `BottomUpSummaryEngine` trên tập con này và chỉ gửi những `HotPath` mới phát sinh sang `GeminiCLIVerifier`.
+
+## 3. Đặc tả Bộ Xuất Báo cáo Chuẩn SARIF 2.1.0 (`reporters/sarif_exporter.py`)
+Xuất kết quả ra file `perf_report.sarif` tuân thủ đúng schema **SARIF 2.1.0** để mở được trực tiếp trong IDE:
+- Mỗi lỗi đã được xác nhận (`CONFIRMED_BOTTLENECK` hoặc điểm tĩnh vượt ngưỡng) là một phần tử trong `runs[0].results`.
+- **Quan trọng nhất — Trường `codeFlows` / `threadFlows`**:
+  - Biểu diễn toàn bộ chuỗi gọi hàm từ `UI Entry Point` (`v_0`) qua các hàm trung gian (`v_1, v_2`) xuống tới `Heavy Sink` (`v_k`) dưới dạng danh sách các `threadFlowLocation` theo đúng thứ tự thực thi.
+  - Tại mỗi bước (`location`), ghi rõ `physicalLocation` (`artifactLocation.uri`, `region.startLine`) và `message.text` mô tả hệ số nhân vòng lặp tại bước đó (VD: `"Step 2: Gọi hàm findCategoryById() bên trong vòng lặp .forEach (Độ sâu vòng lặp tích lũy = 2 -> O(N^2))"`).
+- Đính kèm đề xuất sửa lỗi (`refactoring_diff_suggestion`) từ Gemini CLI vào phần mô tả Markdown (`message.markdown`) của kết quả SARIF.
+
+## 4. Đặc tả Báo cáo Markdown & Sơ đồ Mermaid (`reporters/markdown_reporter.py`)
+Tạo file `PERF_AUDIT_REPORT.md` trực quan cho Developer gồm:
+- Bảng tổng hợp các điểm nghẽn theo mức độ nghiêm trọng (`CRITICAL`, `HIGH`, `MEDIUM`), phân loại theo tác động UX (`FRAME_JANK`, `ANR_RISK`, `COLD_START_DELAY`).
+- Với mỗi điểm nghẽn:
+  - Vẽ một khối sơ đồ **Mermaid Flowchart** thể hiện trực quan đường đi từ hàm UI xuống hàm gây chậm, tô đỏ các cạnh có `loop_depth >= 1` và các nút chứa `Heavy Sink`.
+  - Hiển thị lý do phân tích của Gemini CLI và khối code `diff` hướng dẫn cách tối ưu hóa.
+
+## 5. Đặc tả Giao diện Dòng lệnh (`cli.py`)
+Sử dụng `argparse` hoặc `typer` cung cấp 4 lệnh con:
+1. `scan <repo_path> [--verify-with-gemini] [--top-k 15] [--out-sarif report.sarif] [--out-md report.md]`: Quét toàn bộ mã nguồn, tính điểm tĩnh và tùy chọn gọi Gemini CLI thẩm định Top-K đường đi nguy hiểm nhất.
+2. `diff-scan <repo_path> [--base-ref HEAD~1] [--verify-with-gemini]`: Quét gia tăng siêu tốc chỉ cho các nhánh Call Graph bị ảnh hưởng bởi Git Diff.
+3. `mcp-serve --db-path .perf_index.db`: Khởi chạy MCP Server để tích hợp trực tiếp vào Gemini CLI.
+4. `calibrate <perfetto_trace_csv_or_json>`: Đọc dữ liệu thời gian thực thi thực tế của các hàm để tự động hiệu chỉnh lại trọng số trong `config/android_sinks.json`.
+
+## 6. Yêu cầu Kiểm thử End-to-End (`tests/test_phase4_end_to_end.py`)
+Tạo một thư mục dự án Android mẫu thu nhỏ (Mock Mini Android Repo) ngay trong bài test gồm:
+- `ProductAdapter.kt` (`onBindViewHolder` duyệt qua danh sách khuyến mãi).
+- `PriceUseCase.kt` (nhận diện qua Hilt `@Binds`, bên trong có vòng lặp lồng thứ 2 gọi `Regex` và `SharedPreferences.commit()`).
+- `SafeAnalyticsWorker.kt` (cũng gọi `SharedPreferences` nhưng nằm trong `withContext(Dispatchers.IO)`).
+Chạy toàn bộ pipeline từ Giai đoạn 1 đến Giai đoạn 4 và kiểm tra:
+1. Hệ thống bắt chính xác chuỗi `ProductAdapter.onBindViewHolder -> PriceUseCase -> SharedPreferences.commit` với độ sâu vòng lặp >= 2.
+2. Hệ thống bỏ qua hoàn toàn `SafeAnalyticsWorker` (không báo lỗi giả).
+3. File `.sarif` sinh ra có đầy đủ `codeFlows` hợp lệ và file `.md` chứa sơ đồ Mermaid cùng đề xuất sửa lỗi.

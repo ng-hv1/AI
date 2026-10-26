@@ -1,0 +1,69 @@
+# PROMPT GIAI ĐOẠN 3: AST WITNESS SLICER, DLP SECURITY AIRLOCK & GEMINI CLI VERIFIER (HEADLESS + MCP)
+
+Tiếp tục dự án `android_perf_analyzer`. Hãy triển khai **Giai đoạn 3** để kết nối kết quả từ SQLite Summary Store với **Gemini CLI** nhằm loại bỏ cảnh báo giả (False Positives), ước lượng kích thước tập dữ liệu theo ngữ cảnh nghiệp vụ và tự động đề xuất bản vá (Refactoring Patch). Viết code Python 3.11+ hoàn chỉnh và bộ unit test chạy được bằng `pytest`.
+
+## 1. Các file cần triển khai trong Giai đoạn 3
+1. `ai_verifier/slicer.py`
+2. `ai_verifier/dlp_airlock.py`
+3. `ai_verifier/gemini_cli.py`
+4. `ai_verifier/mcp_server.py`
+5. `tests/test_phase3_ai_verifier.py`
+
+## 2. Đặc tả AST Witness Slicer (`ai_verifier/slicer.py`)
+Viết class `WitnessSlicer`:
+- **Đầu vào**: Một `HotPath` gồm chuỗi các hàm `v_0 (UI Root) -> v_1 -> ... -> v_k (Leaf Sink)` lấy từ `SummaryStore`.
+- **Thuật toán cắt lát ngữ cảnh tối thiểu (Minimal Context Slicing)**:
+  - Với mỗi hàm `v_i` trong chuỗi:
+    1. Trích xuất phần khai báo class chứa `v_i` cùng với **các dòng khai báo thuộc tính (fields/properties) và constructor (`init`)** của class đó (bỏ qua toàn bộ các phương thức khác không nằm trong chuỗi để tiết kiệm token).
+    2. Trích xuất nguyên vẹn phần thân hàm `v_i` kèm số thứ tự dòng gốc.
+    3. Đính kèm chú thích metadata ngay trên đầu mỗi hàm: `// [HOP i] FQN: ... | Local Loop Depth: ... | Loop Bound Type: ... | Detected Sinks: ...`
+  - Giới hạn tổng độ dài lát cắt không vượt quá 250 dòng code để đảm bảo tốc độ phản hồi của Gemini CLI nhanh nhất và không bị nhiễu ngữ cảnh.
+
+## 3. Đặc tả Chốt chặn Bảo mật DLP Airlock (`ai_verifier/dlp_airlock.py`)
+Trước khi gửi bất kỳ chuỗi code nào sang Gemini CLI, bắt buộc phải chạy qua class `DLPAirlock`:
+1. **Quét AST String Literals & Comments**:
+   - Dùng Tree-sitter hoặc biểu thức chính quy (Regex) kết hợp tính Entropy (Shannon Entropy > 4.2 cho chuỗi dài trên 16 ký tự) để phát hiện:
+     - API Keys, Bearer Tokens, AWS/GCP/Firebase Keys, Private Keys (`-----BEGIN...`), Passwords, Secret Keys.
+     - Địa chỉ IP nội bộ, URL endpoint nội bộ, Email, Số điện thoại.
+2. **Cơ chế Redaction bảo toàn cấu trúc cú pháp**:
+   - Thay thế giá trị chuỗi nhạy cảm bằng hằng số định danh có đánh số thứ tự: `"<REDACTED_SECRET_1>"`, `"<REDACTED_URL_1>"`.
+   - Lưu bảng ánh xạ ngược trong bộ nhớ tạm (RAM) để sau khi Gemini CLI trả về đoạn code Refactoring Patch, hệ thống có thể khôi phục lại hằng số gốc nếu cần, tuyệt đối không lưu secret ra file log.
+
+## 4. Đặc tả Bộ Điều phối Gemini CLI Headless (`ai_verifier/gemini_cli.py`)
+Viết class `GeminiCLIVerifier`:
+1. **Cơ chế Caching theo Nội dung (`ai_verifications` table trong SQLite)**:
+   - Tính mã băm `slice_hash = SHA256(sanitized_code_slice + static_metadata_json)`.
+   - Nếu `slice_hash` đã tồn tại trong bảng `ai_verifications`, trả về ngay kết quả JSON đã lưu mà không gọi lại CLI.
+2. **Thiết kế Prompt Kiểm chứng Bác bỏ (CEGAR Refutation Prompt)**:
+   Đóng gói dữ liệu gửi vào `stdin` của lệnh `gemini -p` theo cấu trúc nghiêm ngặt sau:
+   - Cung cấp công thức tính điểm tĩnh của chuỗi hàm, tổng độ sâu vòng lặp liên hàm, và lát cắt mã nguồn đã qua DLP Airlock.
+   - Yêu cầu Gemini CLI đóng vai **Principal Android Performance Verifier** thực hiện 4 bước kiểm tra bác bỏ:
+     - **Kiểm tra 1 (Path Feasibility & Guard Check)**: Có câu lệnh điều kiện (`if`), biến cờ (`isInitialized`), hay cơ chế `memoization/cache` nào chặn khiến nhánh code nặng chỉ chạy tối đa 1 lần rồi thoát sớm ở các lần gọi sau không?
+     - **Kiểm tra 2 (Domain Cardinality Check)**: Dựa trên tên biến và nghiệp vụ của các tập hợp được lặp, kích thước thực tế (N) trong môi trường Production có thể tăng lớn (lớn hơn 20 phần tử) hay luôn bị giới hạn bởi hằng số nghiệp vụ rất nhỏ?
+     - **Kiểm tra 3 (Hidden Threading Check)**: Có cơ chế bất đồng bộ hoặc chuyển luồng ngầm nào qua callback/dispatcher mà bộ phân tích tĩnh chưa nhận diện được không?
+     - **Kiểm tra 4 (Cross-Layer Fix Synthesis)**: Nếu đây là lỗi thật (`verdict = CONFIRMED_BOTTLENECK`), hãy viết đoạn code tối ưu hóa (ví dụ: chuyển `List` sang `HashMap` ở tầng ViewModel/UseCase trước khi truyền xuống Adapter, dùng `Sequence`, hoặc đẩy xuống `withContext(Dispatchers.Default/IO)`).
+3. **Gọi `subprocess` và Xác thực Schema Đầu ra**:
+   - Thực thi: `subprocess.run(["gemini", "-p", system_instruction], input=prompt_payload, text=True, capture_output=True, timeout=90)`.
+   - Hỗ trợ cơ chế truyền biến môi trường hoặc cờ cấu hình model (VD: dùng model nhanh cho Pass 1 lọc thô và model Pro cho Pass 2 sinh bản vá).
+   - Bóc tách khối JSON từ `stdout` và xác thực bằng Pydantic model `VerificationResult`:
+     ```python
+     class VerificationResult(BaseModel):
+         verdict: Literal["CONFIRMED_BOTTLENECK", "FALSE_POSITIVE", "NEEDS_RUNTIME_TRACE"]
+         adjusted_severity: Literal["CRITICAL", "HIGH", "MEDIUM", "LOW", "NONE"]
+         effective_time_complexity: str
+         refutation_or_confirmation_reasoning: str
+         impacted_ux_metric: Literal["FRAME_JANK", "ANR_RISK", "COLD_START_DELAY", "MEMORY_GC_CHURN", "NONE"]
+         refactoring_diff_suggestion: str
+     ```
+
+## 5. Đặc tả MCP Server cho Chế độ Tương tác (`ai_verifier/mcp_server.py`)
+Triển khai một MCP Server chuẩn (giao tiếp qua `stdio`) để người dùng có thể gắn trực tiếp vào `.gemini/settings.json` của Gemini CLI. Cung cấp 4 MCP Tools:
+1. `list_top_ui_hotpaths(limit: int = 10, min_loop_depth: int = 1)`: Trả về danh sách các chuỗi gọi hàm từ Main Thread có điểm rủi ro cao nhất từ SQLite.
+2. `inspect_call_chain_slice(root_fqn: str, target_fqn: str)`: Tự động chạy `WitnessSlicer` + `DLPAirlock` và trả về lát cắt mã nguồn sạch giữa 2 hàm.
+3. `trace_callers_to_ui(method_fqn: str)`: Truy ngược từ bất kỳ hàm nào trong project lên tất cả các UI Entry Points có thể gọi tới nó.
+4. `update_function_summary_override(method_fqn: str, thread_contract: str, loop_bound_override: str, notes: str)`: Cho phép Gemini CLI ghi nhận lại kết quả thẩm định vào SQLite để các lần tính toán đồ thị sau tự động chính xác hơn.
+
+## 6. Yêu cầu Kiểm thử (`tests/test_phase3_ai_verifier.py`)
+1. Test `DLPAirlock`: Đưa vào đoạn code Kotlin có chứa `val apiKey = "AIzaSyD-1234567890abcdef"` và `val url = "https://internal.corp.local/v1/auth"`. Kiểm tra chuỗi đầu ra đã thay bằng `<REDACTED_SECRET_1>` và `<REDACTED_URL_1>`, đồng thời code vẫn giữ nguyên cấu trúc hàm.
+2. Test `WitnessSlicer`: Kiểm tra lát cắt trích xuất từ chuỗi 3 hàm giữ lại đúng khai báo biến class (`private val cache = HashMap<String, User>()`) và thân 3 hàm, loại bỏ các hàm không liên quan trong cùng file.
+3. Test `GeminiCLIVerifier` (dùng Mock `subprocess.run` cho unit test): Kiểm tra cơ chế lưu cache SQLite hoạt động đúng (gọi lần 2 với cùng code slice không kích hoạt lại `subprocess.run`).

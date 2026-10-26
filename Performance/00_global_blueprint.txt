@@ -1,0 +1,38 @@
+# SYSTEM CONTEXT: ANDROID STATIC PERFORMANCE ANALYZER (ASPA)
+
+## 1. Mục tiêu hệ thống
+Xây dựng công cụ phân tích tĩnh lai Neuro-Symbolic (Python 3.11+ + Tree-sitter + SQLite + Gemini CLI) để phát hiện các chuỗi gọi hàm (Call Flows) và thuật toán gây chậm trên Main Thread của ứng dụng Android (Java/Kotlin), làm ảnh hưởng đến trải nghiệm người dùng (UI Jank, rớt khung hình, ANR).
+
+## 2. Tech Stack cố định
+- Ngôn ngữ: Python 3.11+
+- Parser: `tree-sitter==0.21.*` (hoặc bản tương thích với `tree-sitter-java`, `tree-sitter-kotlin`)
+- Lưu trữ đồ thị & Cache: `sqlite3` (Built-in, bật chế độ WAL)
+- Xác thực dữ liệu: `dataclasses` và `pydantic>=2.0`
+- AI Verifier: Gọi `gemini` CLI qua `subprocess` (Headless JSON mode) và `mcp` SDK (Model Context Protocol Server)
+- Kiểm thử: `pytest`
+
+## 3. Cấu trúc thư mục chuẩn
+android_perf_analyzer/
+├── config/
+│   ├── android_entrypoints.json     # Danh sách các hàm khởi phát UI & trọng số
+│   └── android_sinks.json           # Từ điển các API nặng (Binder IPC, I/O, Regex, Lock)
+├── core/
+│   ├── __init__.py
+│   ├── models.py                    # Data structures (FunctionSummary, CallSite, HotPath)
+│   ├── parser.py                    # Tree-sitter AST extractor cho Java & Kotlin
+│   ├── symbol_resolver.py           # Bộ phân giải tên hàm đầy đủ (FQN) qua import/class
+│   ├── stitcher.py                  # Bộ khâu nối cạnh ảo (Dagger/Hilt, Coroutine, StateFlow, Handler)
+│   ├── summary_engine.py            # Tarjan SCC & Quy hoạch động tính điểm Bottom-Up
+│   └── store.py                     # SQLite Summary Store & Incremental Dependency Index
+├── ai_verifier/
+│   ├── __init__.py
+│   ├── slicer.py                    # Trích xuất lát cắt mã nguồn theo đường đi (Witness Slicer)
+│   ├── dlp_airlock.py               # Bộ lọc che giấu Secret/Token/URL nhạy cảm trước khi gọi AI
+│   ├── gemini_cli.py                # Điều phối gọi Gemini CLI chế độ Headless + Cache
+│   └── mcp_server.py                # MCP Server xuất đồ thị cho Gemini CLI truy vấn tương tác
+├── reporters/
+│   ├── __init__.py
+│   ├── sarif_exporter.py            # Xuất chuẩn SARIF 2.1.0 (hỗ trợ codeFlows cho IDE/GitHub)
+│   └── markdown_reporter.py         # Xuất báo cáo Markdown kèm sơ đồ Mermaid & bản vá
+├── cli.py                           # Giao diện dòng lệnh chính (scan, diff-scan, verify, mcp)
+└── tests/                           # Bộ test tự động cho từng giai đoạn

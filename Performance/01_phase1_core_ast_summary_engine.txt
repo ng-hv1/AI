@@ -1,0 +1,120 @@
+# PROMPT GIAI ĐOẠN 1: XÂY DỰNG LÕI AST PARSER, SYMBOL RESOLVER & BOTTOM-UP SUMMARY ENGINE
+
+Hãy đóng vai Senior Principal Software Engineer. Hãy triển khai **Giai đoạn 1** của hệ thống `android_perf_analyzer` theo đúng đặc tả kỹ thuật dưới đây. Không viết code giả (pseudo-code), hãy viết code Python 3.11+ hoàn chỉnh, xử lý đầy đủ ngoại lệ và kèm theo bộ unit test chạy được bằng `pytest`.
+
+## 0. Ngữ cảnh cấu trúc thư mục dự án
+android_perf_analyzer/
+├── core/
+│   ├── __init__.py
+│   ├── models.py
+│   ├── parser.py
+│   ├── symbol_resolver.py
+│   ├── summary_engine.py
+│   └── store.py
+└── tests/
+    └── test_phase1_core.py
+
+## 1. Các file cần triển khai trong Giai đoạn 1
+1. `core/models.py`
+2. `core/store.py`
+3. `core/parser.py`
+4. `core/symbol_resolver.py`
+5. `core/summary_engine.py`
+6. `tests/test_phase1_core.py`
+
+## 2. Đặc tả Data Models (`core/models.py`)
+Định nghĩa các Enum và Dataclass chuẩn sau:
+- `ThreadContext(str, Enum)`:
+  - `UI_MAIN = "UI_MAIN"` (Chạy trên Main Thread)
+  - `WORKER_BG = "WORKER_BG"` (Chạy trên Background Thread)
+  - `SWITCH_TO_BG = "SWITCH_TO_BG"` (Điểm chuyển luồng sang Background như `withContext(Dispatchers.IO)`)
+  - `AGNOSTIC = "AGNOSTIC"` (Hàm thông thường, thừa hưởng ngữ cảnh luồng từ hàm gọi nó)
+- `LoopBoundType(str, Enum)`:
+  - `NONE = "NONE"` (Không nằm trong vòng lặp, multiplier = 1.0)
+  - `CONST_SMALL = "CONST_SMALL"` (Vòng lặp hằng số nhỏ, VD: `0..3`, multiplier = 1.5)
+  - `UI_BOUNDED = "UI_BOUNDED"` (Duyệt qua các phần tử giao diện như `ViewGroup.children`, multiplier = 4.0)
+  - `PARAM_DEPENDENT = "PARAM_DEPENDENT"` (Duyệt qua danh sách truyền từ tham số/biến class, multiplier = 15.0)
+  - `UNBOUNDED_IO = "UNBOUNDED_IO"` (Duyệt qua Cursor DB, File, Network list, multiplier = 30.0)
+- `CallSite`:
+  - `caller_fqn: str`
+  - `callee_raw_name: str`
+  - `callee_fqn: Optional[str]`
+  - `line_number: int`
+  - `local_loop_depth: int` (Số vòng lặp lồng nhau bao quanh lời gọi hàm này trong thân hàm cha)
+  - `loop_bound_type: LoopBoundType`
+  - `edge_thread_context: ThreadContext`
+  - `is_synthetic: bool = False`
+- `FunctionSummary`:
+  - `fqn: str` (Định dạng: `package.ClassName.methodName/arity`)
+  - `file_path: str`
+  - `start_line: int`, `end_line: int`
+  - `ast_hash: str` (Mã băm SHA-256 của nội dung thân hàm sau khi chuẩn hóa khoảng trắng)
+  - `is_ui_entry: bool = False`
+  - `entry_weight: float = 1.0`
+  - `thread_contract: ThreadContext = ThreadContext.AGNOSTIC`
+  - `intrinsic_self_cost: float = 1.0`
+  - `max_internal_loop_depth: int = 0`
+  - `is_recursive: bool = False`
+  - `has_early_return_guard: bool = False` (True nếu đầu hàm có câu lệnh `if (...) return` để kiểm tra cache/điều kiện chặn)
+  - `detected_sinks: List[str]`
+  - `synchronized_locks: List[str]`
+  - `propagated_total_cost: float = 0.0` (Chi phí tổng hợp sau khi chạy quy hoạch động Bottom-Up)
+  - `max_accumulated_loop_depth: int = 0` (Tổng độ sâu vòng lặp lớn nhất từ hàm này xuống các nút lá)
+- `HotPath`:
+  - `root_fqn: str`
+  - `call_chain: List[str]`
+  - `ux_risk_score: float`
+  - `max_accumulated_loop_depth: int`
+  - `bottleneck_summary: str`
+
+## 3. Đặc tả SQLite Summary Store (`core/store.py`)
+Thiết kế class `SummaryStore(db_path: str)` sử dụng `sqlite3` với `PRAGMA journal_mode=WAL;`:
+- Bảng `function_summaries`: Lưu toàn bộ trường của `FunctionSummary` (các trường list lưu dưới dạng JSON text). Khóa chính là `fqn`. Có index trên `file_path` và `is_ui_entry`.
+- Bảng `call_edges`:
+  - `caller_fqn TEXT`, `callee_fqn TEXT`, `line_number INTEGER`, `local_loop_depth INTEGER`, `loop_bound_type TEXT`, `edge_thread_context TEXT`, `is_synthetic INTEGER DEFAULT 0`
+  - Tạo Index trên cả `caller_fqn` (để duyệt xuôi) và `callee_fqn` (để truy ngược Reverse Dependency Cone khi phân tích gia tăng).
+- Các phương thức bắt buộc:
+  - `upsert_function_summary(summary: FunctionSummary)`
+  - `replace_call_edges_for_caller(caller_fqn: str, edges: List[CallSite])`
+  - `get_reverse_dependents(changed_fqns: Set[str]) -> Set[str]`: Dùng truy vấn đệ quy `WITH RECURSIVE` trong SQLite để tìm tất cả các hàm tổ tiên gọi trực tiếp hoặc gián tiếp tới các hàm vừa thay đổi.
+
+## 4. Đặc tả Tree-sitter Parser & Heuristic Symbol Resolver (`core/parser.py`, `core/symbol_resolver.py`)
+1. **Nhận diện Vòng lặp (Loop Nodes) trên AST**:
+   - Với **Java**: `for_statement`, `enhanced_for_statement`, `while_statement`, `do_statement`, và các lời gọi stream/collection `.forEach(...)`, `.map(...)`, `.filter(...)`, `.flatMap(...)`.
+   - Với **Kotlin**: `for_statement`, `while_statement`, `do_while_statement`, và các hàm Higher-Order trên Collection có truyền `lambda_literal` hoặc `annotated_lambda`: `forEach`, `forEachIndexed`, `map`, `mapNotNull`, `filter`, `flatMap`, `find`, `firstOrNull`, `any`, `all`, `count`, `sortedBy`, `groupBy`.
+   - **Quy tắc tính `local_loop_depth`**: Khi tìm thấy một lời gọi hàm (`method_invocation` trong Java hoặc `call_expression` trong Kotlin), hãy duyệt ngược theo trục tổ tiên (`node.parent`) cho tới khi chạm tới node khai báo hàm (`method_declaration` / `function_declaration`). Đếm tổng số node vòng lặp hoặc lambda của các hàm lặp Collection đi qua trên đường lên đó.
+2. **Phân loại Cận vòng lặp (`LoopBoundType`)**:
+   - Nếu biểu thức lặp trong `for` là một khoảng hằng số nguyên (VD: `0..3`, `0 until 5`, `i < 4` với cận hằng số <= 10) -> trả về `CONST_SMALL`.
+   - Nếu biểu thức lặp gọi trên biến có tên/kiểu liên quan tới `children`, `childCount` của `ViewGroup` -> trả về `UI_BOUNDED`.
+   - Ngược lại -> mặc định trả về `PARAM_DEPENDENT`.
+3. **Symbol Resolver 2-Pass (`core/symbol_resolver.py`)**:
+   - **Pass 1 (Indexing)**: Quét nhanh toàn bộ các file `.java` và `.kt` trong project để xây dựng bảng `SymbolTable`: ánh xạ `(package_name, class_name, method_name, arity)` và danh sách các class/interface kế thừa (`superclass`, `interfaces`).
+   - **Pass 2 (Call Resolution)**: Với mỗi lời gọi hàm `receiver.methodName(arg1, arg2)` trong thân hàm:
+     - Xác định kiểu của `receiver` dựa trên: (a) Tham số của hàm hiện tại, (b) Khai báo biến cục bộ trong hàm (`val x = Foo()` hoặc `val x: Foo`), (c) Thuộc tính (field/property) của class hiện tại, (d) Danh sách `import` ở đầu file.
+     - Nếu không có `receiver` (gọi hàm nội bộ), nối vào class hiện tại hoặc các hàm top-level cùng package / được import.
+
+## 5. Đặc tả Thuật toán Tarjan SCC & Quy hoạch động Bottom-Up (`core/summary_engine.py`)
+Viết class `BottomUpSummaryEngine`:
+1. **Bước 1: Phát hiện Chu trình Đệ quy bằng Tarjan's Strongly Connected Components (SCC)**:
+   - Dựng đồ thị có hướng G = (V, E) từ bảng `call_edges` (chỉ xét các cạnh có `edge_thread_context != SWITCH_TO_BG`).
+   - Chạy thuật toán Tarjan để tìm các thành phần liên thông mạnh (SCC).
+   - Nếu một SCC có kích thước > 1, hoặc có kích thước == 1 nhưng có cạnh tự khuyên (u -> u), đánh dấu tất cả các hàm trong SCC đó là `is_recursive = True` và cộng thêm hệ số phạt đệ quy tương đương 1 cấp vòng lặp (`loop_multiplier = 15.0`).
+2. **Bước 2: Lan truyền Trọng số từ Dưới lên trên Đồ thị Ngưng tụ (Condensation DAG)**:
+   - Gom mỗi SCC thành 1 Super-Node để thu được đồ thị không chu trình (DAG).
+   - Sắp xếp Tô-pô ngược (từ nút lá không gọi hàm nào ngược lên các nút gốc UI Entry):
+   - Với mỗi hàm u:
+     `propagated_total_cost(u) = intrinsic_self_cost(u) + sum_{e=(u->v)} ( M(loop_bound_type(e)) ^ local_loop_depth(e) * propagated_total_cost(v) )`
+     Trong đó `M(NONE) = 1.0`, `M(CONST_SMALL) = 1.5`, `M(UI_BOUNDED) = 4.0`, `M(PARAM_DEPENDENT) = 15.0`, `M(UNBOUNDED_IO) = 30.0`.
+     Nếu cạnh `e=(u->v)` có `edge_thread_context == SWITCH_TO_BG`, bỏ qua cạnh đó (đóng góp chi phí vào Main Thread bằng 0).
+   - Tính độ sâu vòng lặp tích lũy lớn nhất:
+     `max_accumulated_loop_depth(u) = max_{e=(u->v)} ( local_loop_depth(e) + max_accumulated_loop_depth(v) )`
+3. **Bước 3: Trích xuất Top-K Critical Hot Paths**:
+   - Từ mỗi hàm có `is_ui_entry == True`, tính `ux_risk_score = entry_weight * propagated_total_cost`.
+   - Truy vết đường đi (Witness Trace) từ UI Entry xuống nút lá có đóng góp trọng số lớn nhất hoặc có `max_accumulated_loop_depth >= 2`.
+
+## 6. Yêu cầu Kiểm thử (`tests/test_phase1_core.py`)
+Viết ít nhất 4 test cases bằng `pytest`:
+1. Parse một chuỗi 3 hàm Kotlin nằm ở 2 file khác nhau: `Adapter.onBindViewHolder` gọi `Helper.formatItems` trong `.forEach`, và `Helper.formatItems` gọi `Validator.check` trong vòng lặp `for`. Kiểm tra `max_accumulated_loop_depth` tại `onBindViewHolder` phải bằng `2`.
+2. Kiểm tra vòng lặp hằng số nhỏ `for (i in 0..2)` được gán `CONST_SMALL` và có điểm thấp hơn hẳn vòng lặp `for (item in userItems)`.
+3. Kiểm tra phát hiện đệ quy tương hỗ `funA() -> funB() -> funA()` bằng Tarjan SCC mà không bị treo vòng lặp vô hạn.
+4. Kiểm tra tính năng Incremental SQLite: khi chỉ sửa 1 hàm lá, `get_reverse_dependents()` trả về đúng tập hàm cha cần tính lại.
