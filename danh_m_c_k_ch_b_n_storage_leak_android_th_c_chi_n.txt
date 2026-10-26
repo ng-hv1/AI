@@ -1,0 +1,361 @@
+================================================================================
+CẨM NANG PHÂN TÍCH TĨNH STORAGE LEAK TRÊN ANDROID THEO VÒNG ĐỜI FILE
+(Tài liệu mở rộng cho StorageLeakChecker: Tier 1 Regex + Tier 2 Sub-agent Rules)
+================================================================================
+
+Trong thực tế vận hành ứng dụng Android, Storage Leak thường xuất phát từ sự đứt
+gãy vòng đời của file khi đi qua nhiều bước xử lý:
+Create -> Copy -> Transform -> Move -> Share -> Delete.
+
+Dưới đây là 18 kịch bản thực chiến chia theo 6 giai đoạn vòng đời file, kèm dấu
+hiệu nhận biết trên cây cú pháp (AST) và bộ Regex mở rộng cho `src/constants.py`.
+
+--------------------------------------------------------------------------------
+1. GIAI ĐOẠN TẠO & GHI FILE (FILE CREATION & WRITING TRAPS)
+--------------------------------------------------------------------------------
+
+1.1. Bẫy `AtomicFile` quên gọi `failWrite()` khi xảy ra lỗi
+- Tình huống: Khi ghi các file cấu hình quan trọng hoặc dữ liệu JSON/Binary lớn,
+  lập trình viên dùng `androidx.core.util.AtomicFile` để tránh hỏng dữ liệu nếu
+  ứng dụng bị crash giữa chừng.
+- Cơ chế gây Leak: Gọi `atomicFile.startWrite()` sẽ tạo hoặc đổi tên file sang
+  bản tạm (`.new` / `.bak`). Nếu quá trình ghi ném `IOException` mà khối `catch`
+  không gọi `atomicFile.failWrite(outStream)`, file tạm và stream sẽ bị bỏ lại
+  vĩnh viễn trên ổ đĩa.
+- Tín hiệu AST: Có `AtomicFile` + `startWrite()` nhưng trong `catch` thiếu
+  `failWrite()`.
+
+1.2. File tải đa luồng / nối mảnh (Chunked & Resumable Download)
+- Tình huống: Tải video, bộ từ điển hoặc gói tài nguyên lớn bằng cách chia thành
+  nhiều mảnh (`part_0.tmp`, `part_1.tmp`, `part_2.tmp`) rồi ghép (`merge`) thành
+  file hoàn chỉnh `output.mp4`.
+- Cơ chế gây Leak:
+  (a) Khi hủy tải hoặc mất mạng ở mảnh thứ $k$, ứng dụng chỉ xóa mảnh thứ $k$
+      mà quên xóa các mảnh từ $0$ đến $k-1$ đã tải xong trước đó.
+  (b) Sau khi ghép xong `output.mp4` bằng `FileChannel.transferFrom()`, code
+      quên xóa các file mảnh thành phần.
+- Tín hiệu AST: Tạo file trong vòng lặp (`for` / `repeat` / `mapIndexed`) hoặc
+  tên file có hậu tố `.part`, `.tmp`, `.chunk`, `.download`.
+
+1.3. Tạo file 0-byte trước khi kiểm tra điều kiện thoát sớm (Early Return Leak)
+- Tình huống:
+  ```kotlin
+  val outFile = File(context.filesDir, "export_${System.currentTimeMillis()}.png")
+  FileOutputStream(outFile).use { out ->
+      val bitmap = decodeBitmap(uri) ?: return // LEAK FILE RỖNG 0-BYTE!
+      bitmap.compress(Bitmap.CompressFormat.PNG, 90, out)
+  }
+  ```
+- Cơ chế gây Leak: Ngay khoảnh khắc `FileOutputStream(outFile)` khởi tạo, hệ
+  điều hành đã cấp phát inode và tạo file vật lý trên ổ đĩa. Nếu lệnh bên trong
+  `return` sớm (do dữ liệu đầu vào `null`) hoặc `Bitmap.compress()` trả về
+  `false`, một file rác 0-byte (hoặc file hỏng) sẽ nằm lại mãi mãi trong
+  `filesDir`.
+- Tín hiệu AST: Khởi tạo `FileOutputStream(file)` trước các câu lệnh điều kiện
+  `if (...) return` hoặc toán tử Elvis `?: return` mà không có `file.delete()`.
+
+--------------------------------------------------------------------------------
+2. GIAI ĐOẠN SAO CHÉP & DI CHUYỂN (COPY, MOVE & CROSS-MOUNT TRAPS)
+--------------------------------------------------------------------------------
+
+2.1. Cầu nối Scoped Storage (`content://` URI -> Copy ra Local File)
+     [Lỗi phổ biến số 1 trên Android 10+]
+- Tình huống: Khi người dùng chọn ảnh/video/tài liệu từ Photo Picker hoặc SAF
+  (`Intent.ACTION_OPEN_DOCUMENT`), ứng dụng chỉ nhận được một `content://` URI.
+  Vì các thư viện xử lý file (FFmpeg, OpenCV, PDFium, Luban, hoặc `MultipartBody`
+  của Retrofit) yêu cầu đối tượng `java.io.File` thật, lập trình viên thường viết
+  hàm tiện ích `uriToFile(context, uri)`:
+  ```kotlin
+  fun copyUriToTempFile(context: Context, uri: Uri): File {
+      val temp = File(context.cacheDir, "picker_${System.currentTimeMillis()}.jpg")
+      context.contentResolver.openInputStream(uri)?.use { input ->
+          temp.outputStream().use { output -> input.copyTo(output) }
+      }
+      return temp // Trả về cho ViewModel/Repository dùng rồi bị bỏ quên!
+  }
+  ```
+- Cơ chế gây Leak: File gốc đã nằm sẵn trong bộ nhớ máy của người dùng. Bản copy
+  trong `cacheDir` hoặc `filesDir` chỉ phục vụ việc đọc/upload tạm thời, nhưng
+  sau khi upload xong không có tầng nào chịu trách nhiệm xóa bản copy này.
+- Tín hiệu AST: Hàm nhận tham số `Uri`, gọi `contentResolver.openInputStream` +
+  `copyTo` (hoặc vòng lặp `read`/`write`) và trả về `File` hoặc `String` (path).
+
+2.2. Bẫy `File.renameTo()` khác phân vùng (Cross-Filesystem Rename Failure)
+- Tình huống: Di chuyển file từ vùng đệm nội bộ (`cacheDir` trên phân vùng
+  `/data`) sang bộ nhớ ngoài hoặc thẻ nhớ SD (`getExternalFilesDirs()`), hoặc
+  ngược lại.
+- Cơ chế gây Leak:
+  - Hàm `sourceFile.renameTo(destFile)` gọi trực tiếp syscall `rename(2)` của
+    Linux, luôn thất bại và trả về `false` (KHÔNG ném Exception) nếu nguồn và
+    đích khác mount point hoặc file đích đã tồn tại trên một số bản Android.
+  - Lỗi 1: Gọi `tempFile.renameTo(destFile)` nhưng không kiểm tra giá trị
+    boolean trả về -> `tempFile` vẫn nằm nguyên ở thư mục tạm.
+  - Lỗi 2: Viết nhánh dự phòng `if (!tempFile.renameTo(destFile)) { tempFile.copyTo(destFile) }`
+    nhưng sau khi `copyTo` thành công lại quên gọi `tempFile.delete()`.
+- Tín hiệu AST: Lời gọi `.renameTo(` không nằm trong biểu thức điều kiện `if`,
+  hoặc nhánh fallback dùng `copyTo` nhưng thiếu `source.delete()`.
+
+2.3. `File.copyTo()` / `Files.copy()` sập giữa chừng vì đầy bộ nhớ hoặc lỗi I/O
+- Tình huống: Sao chép một file video lớn (ví dụ 500MB) bằng hàm mở rộng
+  `sourceFile.copyTo(targetFile, overwrite = true)` của Kotlin.
+- Cơ chế gây Leak: Nếu sao chép được 450MB thì ném `IOException` (do hết dung
+  lượng đĩa hoặc lỗi đọc/ghi), hàm `copyTo()` thoát ra với ngoại lệ nhưng KHÔNG
+  tự động xóa `targetFile` đã ghi dở 450MB trên ổ đĩa.
+- Tín hiệu AST: Gọi `.copyTo(` hoặc `Files.copy(` mà khối `catch (e: IOException)`
+  không gọi `targetFile.delete()`.
+
+--------------------------------------------------------------------------------
+3. GIAI ĐOẠN BIẾN ĐỔI MEDIA, NÉN & GIẢI NÉN (TRANSFORM & ARCHIVE TRAPS)
+--------------------------------------------------------------------------------
+
+3.1. Chuỗi biến đổi Media đa tầng (Chained Media Transformation Pipeline)
+- Tình huống: Luồng xử lý ảnh/video trước khi đăng bài hoặc xác thực eKYC:
+  Ảnh gốc Camera (File A) -> Xoay chiều EXIF (File B) -> Cắt khung Crop (File C)
+  -> Đóng dấu Watermark (File D) -> Nén WebP (File E).
+- Cơ chế gây Leak: Mỗi hàm `rotate(file)`, `crop(file)`, `addWatermark(file)`
+  nhận vào một `File` và tạo ra một `File` mới rồi trả về. Ở cuối chuỗi, hàm
+  upload chỉ xóa `File E` (và đôi khi xóa `File A`), bỏ quên hoàn toàn các file
+  trung gian `File B`, `File C`, `File D`.
+- Tín hiệu AST: Các hàm có chữ ký dạng `fun ...(input: File): File` tạo đối
+  tượng `File` mới bên trong thân hàm mà không xóa `input` (hoặc caller không
+  xóa biến truyền vào sau khi nhận kết quả trả về).
+
+3.2. Quay Video / Ghi âm phân đoạn & Bản nháp bị bỏ rơi (Abandoned Media Drafts)
+- Tình huống: Tính năng quay video ngắn hoặc ghi âm sử dụng `CameraX`
+  (`OutputFileOptions`), `MediaRecorder`, hoặc `MediaMuxer`. Mỗi lần bấm tạm
+  dừng/tiếp tục sẽ tạo một segment (`seg_1.mp4`, `seg_2.mp4`), sau đó nối lại.
+- Cơ chế gây Leak: Khi người dùng đang quay dở 3 segment rồi bấm nút Back hủy
+  bỏ hoặc vuốt đóng ứng dụng, nếu không có cơ chế dọn dẹp thư mục `drafts/` khi
+  hủy phiên hoặc khi khởi động lại màn hình Camera, các segment video hàng trăm
+  MB sẽ bị bỏ lại trong `filesDir`.
+- Tín hiệu AST: Sử dụng `MediaRecorder.setOutputFile`, `MediaMuxer`, hoặc
+  `OutputFileOptions.Builder(file)` trong `Activity`/`Fragment`/`ViewModel` mà
+  không có lệnh dọn dẹp tương ứng khi hủy thao tác (`onCleared` / `onDestroy` /
+  hàm Cancel).
+
+3.3. Giải nén Archive (`.zip`, `.tar`, `.gz`) gặp lỗi ở file thứ $k$
+- Tình huống: Tải gói tài nguyên giao diện, bộ sticker, hoặc dữ liệu offline
+  dạng `.zip` rồi giải nén bằng `ZipInputStream`.
+- Cơ chế gây Leak:
+  (a) Giải nén thành công toàn bộ thư mục nhưng quên xóa file gốc `bundle.zip`.
+  (b) Trong gói `.zip` có 100 file, giải nén đến file thứ 60 thì gặp
+      `ZipException`, `IOException` hoặc phát hiện lỗi bảo mật `ZipSlip`. Khối
+      `catch` chỉ xóa mỗi file `bundle.zip` mà không gọi
+      `targetExtractDir.deleteRecursively()`, để lại 59 file đã giải nén dở dang.
+- Tín hiệu AST: Vòng lặp `zipInputStream.nextEntry` ghi ra nhiều file con nhưng
+  trong khối `catch` thiếu lệnh xóa đệ quy thư mục đích (`deleteRecursively()`).
+
+--------------------------------------------------------------------------------
+4. GIAI ĐOẠN CẬP NHẬT TÀI NGUYÊN ĐỘNG & ĐỒNG BỘ DB (OTA ASSETS & STATE SYNC)
+--------------------------------------------------------------------------------
+
+4.1. Cập nhật AI Model / Dynamic Feature / Asset Versioning quên xóa bản cũ
+- Tình huống: Ứng dụng tải mô hình AI xuống máy (`face_detect_v1.tflite`,
+  `llm_quantized_v1.gguf`), bộ font chữ, hiệu ứng AR hoặc gói bundle theo version:
+  ```kotlin
+  val modelFile = File(context.noBackupFilesDir, "model_${config.version}.tflite")
+  if (!modelFile.exists()) {
+      downloadModel(config.url, modelFile) // Tải v2 nhưng quên xóa v1!
+  }
+  ```
+- Cơ chế gây Leak: Khi server nâng cấp lên `v2`, `v3`, ứng dụng tạo file mới
+  theo tên version mới nhưng không quét xóa các file `model_*.tflite` của các
+  version cũ trong `noBackupFilesDir` hoặc `filesDir`. Mỗi file model nặng từ
+  vài chục MB đến hàng GB.
+- Tín hiệu AST: Tên file trong `filesDir` / `noBackupFilesDir` được ghép chuỗi
+  với biến `version`, `hash`, `md5`, `etag` nhưng không có logic `listFiles()`
+  để lọc và xóa các phiên bản cũ.
+
+4.2. Cập nhật / Xóa bản ghi Database làm đứt liên kết tới File vật lý
+- Tình huống:
+  (a) Khi `DELETE` một tin nhắn thoại hoặc một ghi chú trong Room/SQLite, ứng
+      dụng chỉ xóa dòng dữ liệu trong bảng mà quên xóa file `.m4a` / `.jpg`
+      được trỏ tới bởi cột `localFilePath`.
+  (b) Khi `UPDATE` ảnh đại diện hoặc ảnh hóa đơn bằng một đường dẫn file mới
+      (`receipt_<new_uuid>.jpg`), cột `filePath` trong DB bị ghi đè sang đường
+      dẫn mới khiến đường dẫn cũ bị mất dấu hoàn toàn mà file vật lý cũ chưa
+      được xóa.
+- Tín hiệu AST: Các phương thức DAO `@Delete`, `@Update`, `@Query("DELETE...")`,
+  `@Query("UPDATE...")` trên Entity có trường chứa chữ `Path`, `File`, `Uri` mà
+  tầng Repository gọi nó không thực hiện `File(oldPath).delete()`.
+
+--------------------------------------------------------------------------------
+5. GIAI ĐOẠN CHIA SẺ LIÊN ỨNG DỤNG & WEBVIEW/SDK (IPC & SDK TRAPS)
+--------------------------------------------------------------------------------
+
+5.1. Bẫy `FileProvider` bất đồng bộ (Asynchronous Intent Share Trap)
+- Tình huống: Xuất ảnh biên lai giao dịch hoặc file báo cáo PDF/CSV ra thư mục
+  `cacheDir/shared/receipt_123.png`, lấy URI qua `FileProvider.getUriForFile()`
+  và gọi `startActivity(Intent.createChooser(shareIntent, ...))`.
+- Cơ chế gây Leak: Vì `startActivity` chạy bất đồng bộ (ứng dụng nhận chia sẻ
+  như Gmail/Zalo/Telegram sẽ đọc file này vài giây hoặc vài phút sau đó), lập
+  trình viên không thể gọi `file.delete()` ngay sau lệnh `startActivity()`. Hệ
+  quả là file bị bỏ mặc và tích tụ qua từng lần chia sẻ nếu không có cơ chế quét
+  dọn thư mục `shared/` vào lần khởi động app tiếp theo.
+- Tín hiệu AST: Có `FileProvider.getUriForFile(` đi kèm `ACTION_SEND` /
+  `ACTION_VIEW` nhưng thư mục chứa file đó không nằm trong danh sách được dọn
+  dẹp lúc khởi động (`cleanup_index`).
+
+5.2. `WebChromeClient.onShowFileChooser` (Bấm Hủy khi chụp ảnh từ WebView)
+- Tình huống: Màn hình eKYC hoặc hỗ trợ khách hàng chạy trên `WebView`. Khi người
+  dùng bấm nút tải ảnh lên trong WebView, Android gọi `onShowFileChooser()`.
+- Cơ chế gây Leak: Để mở Camera hệ thống chụp ảnh trả về cho WebView, ứng dụng
+  phải tạo trước một file rỗng `tempPhotoFile` trên ổ đĩa để truyền URI vào
+  `MediaStore.EXTRA_OUTPUT`. Nếu người dùng mở Camera lên nhưng bấm nút Hủy
+  (`Activity.RESULT_CANCELED`), ứng dụng chỉ gọi `callback.onReceiveValue(null)`
+  để trả kết quả cho WebView mà quên gọi `tempPhotoFile.delete()`.
+- Tín hiệu AST: Tạo file gắn với `MediaStore.EXTRA_OUTPUT` hoặc
+  `ActivityResultContracts.TakePicture` nhưng nhánh xử lý `resultCode != RESULT_OK`
+  (hoặc `success == false`) không xóa file tạm đã tạo trước đó.
+
+--------------------------------------------------------------------------------
+6. NĂM "CÁI BẪY API" KHI XÓA FILE TRÊN ANDROID (FAKE DELETION TRAPS)
+--------------------------------------------------------------------------------
+Đây là các trường hợp cực kỳ quan trọng cho Vòng 1 và Vòng 2 vì trong code ĐÃ CÓ
+lệnh xóa, nhưng thực tế lệnh xóa đó KHÔNG giải phóng được dung lượng:
+
+[Bẫy 6.1] Gọi `dir.delete()` trên thư mục không rỗng
+- Code lỗi:
+  ```kotlin
+  val unzipDir = File(context.cacheDir, "session_123")
+  // ... giải nén 10 file vào unzipDir ...
+  unzipDir.delete() // LUÔN TRẢ VỀ FALSE VÀ KHÔNG XÓA GÌ CẢ!
+  ```
+- Bản chất kỹ thuật: Trong Java/Kotlin trên Linux, `File.delete()` gọi trên một
+  thư mục chỉ thành công khi thư mục đó hoàn toàn trống rỗng. Nếu bên trong còn
+  dù chỉ 1 file con, `delete()` âm thầm trả về `false`.
+- Cách sửa chuẩn: Phải dùng `unzipDir.deleteRecursively()` (Kotlin) hoặc viết
+  hàm đệ quy xóa sạch toàn bộ phần tử con trước khi xóa thư mục cha (Java).
+
+[Bẫy 6.2] Truyền `Uri.path` hoặc `Uri.toString()` vào `File().delete()`
+- Code lỗi:
+  ```kotlin
+  val uri: Uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+  // ... khi xảy ra lỗi ...
+  File(uri.path!!).delete() // LUÔN TRẢ VỀ FALSE!
+  ```
+- Bản chất kỹ thuật: Với `content://` URI (từ `MediaStore`, `FileProvider`, SAF),
+  `uri.path` chỉ là đường dẫn định danh ảo (ví dụ `/external/images/media/1024`),
+  không phải đường dẫn hệ thống file POSIX thực tế. Khởi tạo `File(uri.path)`
+  rồi gọi `.delete()` luôn thất bại.
+- Cách sửa chuẩn: Bắt buộc phải gọi `contentResolver.delete(uri, null, null)`.
+
+[Bẫy 6.3] Phụ thuộc vào `File.deleteOnExit()`
+- Code lỗi:
+  ```kotlin
+  val temp = File.createTempFile("upload_", ".tmp", context.cacheDir)
+  temp.deleteOnExit()
+  ```
+- Bản chất kỹ thuật: `deleteOnExit()` đăng ký một JVM Shutdown Hook chỉ chạy khi
+  tiến trình thoát bình thường qua `System.exit()`. Trên Android, vòng đời ứng
+  dụng do hệ thống quản lý; khi ứng dụng xuống nền, Low Memory Killer (`lmkd`)
+  hoặc người dùng vuốt đóng app sẽ gửi tín hiệu `SIGKILL` tiêu diệt process ngay
+  lập tức mà không bao giờ chạy JVM Shutdown Hook.
+- Cách sửa chuẩn: Xóa chủ động trong khối `finally` hoặc quét xóa thư mục tạm khi
+  khởi động ứng dụng.
+
+[Bẫy 6.4] Gọi hàm `suspend` trong khối `finally` của Coroutine mà thiếu `NonCancellable`
+- Code lỗi:
+  ```kotlin
+  try {
+      downloadFileSuspend(tempFile)
+  } finally {
+      cleanupRepository.deleteTempFileSuspend(tempFile) // BỊ BỎ QUA KHI CANCEL!
+  }
+  ```
+- Bản chất kỹ thuật: Khi một Coroutine đang ở trạng thái `Cancelling` (ví dụ
+  người dùng thoát màn hình làm `viewModelScope` bị hủy), mọi lời gọi tới một
+  hàm `suspend` khác bên trong khối `finally` sẽ lập tức ném `CancellationException`
+  ngay tại điểm tạm dừng (suspension point) đầu tiên, khiến lệnh xóa file bên
+  trong hàm đó không bao giờ được thực thi.
+- Cách sửa chuẩn: Dùng hàm xóa đồng bộ `tempFile.delete()` trực tiếp, hoặc bọc
+  lời gọi `suspend` trong `withContext(NonCancellable) { ... }`.
+
+[Bẫy 6.5] Xóa file khi Stream hoặc `MappedByteBuffer` / `ParcelFileDescriptor` chưa đóng
+- Code lỗi:
+  ```kotlin
+  val raf = RandomAccessFile(tempFile, "rw")
+  raf.write(bytes)
+  tempFile.delete() // Trả về true nhưng dung lượng ổ đĩa KHÔNG được giải phóng!
+  ```
+- Bản chất kỹ thuật: Trên Linux/Android filesystem (`ext4` / `f2fs`), `delete()`
+  chỉ thực hiện syscall `unlink()` để xóa tên file khỏi bảng thư mục. Toàn bộ
+  khối dữ liệu vật lý gắn với `inode` vẫn bị giữ chặt trên ổ đĩa cho đến khi mọi
+  File Descriptor (`fd`) đang mở file đó được gọi `close()`.
+- Cách sửa chuẩn: Bắt buộc bọc mọi Stream, `RandomAccessFile`, `FileChannel`,
+  `ParcelFileDescriptor` trong `.use { ... }` (Kotlin) hoặc `try-with-resources` (Java).
+
+--------------------------------------------------------------------------------
+7. MÃ NGUỒN BỔ SUNG CHO `src/constants.py` (TIER 1 PRE-FILTER & CLEANUP INDEX)
+--------------------------------------------------------------------------------
+
+Bạn có thể copy trực tiếp các danh sách Regex dưới đây vào `src/constants.py`
+để tăng độ nhạy cho `lexical_filter.py` và `cleanup_index.py`:
+
+```python
+# Danh sách các API Tạo / Ghi / Sao chép / Biến đổi File (Write & Creation Sinks)
+STORAGE_WRITE_SINKS = [
+    # 1. Standard File & Directory Creation
+    r"createTempFile\s*\(",
+    r"createTempDirectory\s*\(",
+    r"createTempDir\s*\(",
+    r"createNewFile\s*\(",
+    r"mkdirs?\s*\(",
+    r"openFileOutput\s*\(",
+
+    # 2. Streams, Writers & Channels
+    r"FileOutputStream\s*\(",
+    r"FileWriter\s*\(",
+    r"RandomAccessFile\s*\(",
+    r"FileChannel\.open\s*\(",
+    r"Channels\.newChannel\s*\(",
+    r"AtomicFile\s*\(",
+    r"\.startWrite\s*\(",
+
+    # 3. Kotlin I/O Extensions (Tạo hoặc ghi/sao chép dữ liệu trực tiếp)
+    r"\.writeBytes\s*\(",
+    r"\.writeText\s*\(",
+    r"\.appendBytes\s*\(",
+    r"\.appendText\s*\(",
+    r"\.outputStream\s*\(",
+    r"\.printWriter\s*\(",
+    r"\.bufferedWriter\s*\(",
+    r"\.copyTo\s*\(",
+    r"\.copyRecursively\s*\(",
+    r"Files\.copy\s*\(",
+    r"Files\.move\s*\(",
+    r"FileUtils\.copy",
+    r"\.renameTo\s*\(",
+    r"transferTo\s*\(",
+    r"transferFrom\s*\(",
+
+    # 4. Media, Camera, Archive & ContentResolver Sinks
+    r"Bitmap\.compress\s*\(",
+    r"ZipInputStream\s*\(",
+    r"ZipOutputStream\s*\(",
+    r"MediaRecorder\s*\(",
+    r"\.setOutputFile\s*\(",
+    r"MediaMuxer\s*\(",
+    r"OutputFileOptions\.Builder\s*\(",
+    r"EXTRA_OUTPUT",
+    r"TakePicture\s*\(",
+    r"onShowFileChooser\s*\(",
+    r"IS_PENDING",
+    r"contentResolver\.insert\s*\(",
+    r"openOutputStream\s*\(",
+    r"openFileDescriptor\s*\(",
+    r"ParcelFileDescriptor\.open\s*\(",
+    r"FileProvider\.getUriForFile\s*\(",
+    r"DownloadManager\.Request\s*\(",
+]
+
+# Danh sách các "Bẫy Xóa Giả" (Suspicious / Ineffective Cleanup Patterns)
+# Tier 1 có thể gắn nhãn cảnh báo [TRAP_WARNING] ngay trong CandidateFile
+# để nhắc Gemini soi kỹ ở Vòng 1 và Vòng 2:
+SUSPICIOUS_CLEANUP_TRAPS = [
+    (r"\.deleteOnExit\s*\(", "Bẫy deleteOnExit(): JVM shutdown hook không chạy khi Android kill process"),
+    (r"File\s*\([^)]*\.path\b[^)]*\)\s*\.delete", "Bẫy File(uri.path).delete(): Không xóa được content:// URI"),
+    (r"\.renameTo\s*\(", "Bẫy renameTo(): Dễ thất bại ngầm nếu khác mount point hoặc quên xóa file nguồn khi fallback copy"),
+    (r"AtomicFile\s*\(", "Bẫy AtomicFile: Kiểm tra xem khối catch có gọi failWrite() hay không"),
+]
+```
