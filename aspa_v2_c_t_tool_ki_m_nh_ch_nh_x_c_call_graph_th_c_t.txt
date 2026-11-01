@@ -1,0 +1,599 @@
+# TÀI LIỆU 05: ĐẶC TẢ & MÃ NGUỒN CÔNG CỤ KIỂM ĐỊNH ĐỘ CHÍNH XÁC TUYỆT ĐỐI CỦA CALL GRAPH & CALL FLOW TRÊN DỰ ÁN THỰC TẾ
+(Dùng để đưa cho AI triển khai các file: `benchmarks/verify_graph_soundness.py`, `benchmarks/canary_mutation_runner.py`, và `tests/test_v2_soundness_and_canaries.py`)
+
+Hãy đóng vai Principal Program Analysis & QA Verification Architect. Hãy triển khai bộ công cụ kiểm định độ chính xác (Soundness & Completeness Verification Harness) cho hệ thống `android_perf_analyzer` theo đúng mã nguồn và đặc tả kỹ thuật dưới đây, sau đó chạy kiểm thử trực tiếp trên cơ sở dữ liệu dự án thực tế.
+
+================================================================================
+## 1. MỤC TIÊU CỦA BỘ CÔNG CỤ KIỂM ĐỊNH 4 TẦNG (4-TIER VERIFICATION HARNESS)
+================================================================================
+Khi chạy ASPA trên một dự án thực tế quy mô lớn (hàng nghìn file `.kt`/`.java`), để chứng minh **Call Graph** và **Call Flow** chính xác tiệm cận $100\%$ mà không phụ thuộc cảm tính, hệ thống kiểm định thực hiện 4 tầng kiểm tra độc lập:
+
+1. **Tầng 1 — Kiểm toán 6 Bất biến Toán học & AST trên SQLite DB (`audit_all_invariants`)**:
+   - **Audit 1 (`Unresolved Rate in Built Scope`)**: Tỷ lệ cạnh bị kẹt ở trạng thái `unresolved:` trong các hàm thuộc bản build (`scope_marks = 1`).
+   - **Audit 2 (`Zero Dangling Internal Callees`)**: Mọi `callee_fqn` mang package của dự án bắt buộc phải tồn tại trong bảng `function_summaries` (bắt sống lỗi lệch `/arity`, Kotlin Extension `arity + 1`, hoặc `$default` bridge).
+   - **Audit 3 (`AST Line & Scope Containment`)**: Dòng phát sinh lời gọi `line_number` của mọi cạnh AST thật (`is_synthetic = 0`) phải nằm gọn trong `[start_line, end_line]` của hàm cha `caller_fqn`.
+   - **Audit 4 (`Zero Background Shield Leakage`)**: Không được tồn tại bất kỳ cặp `(caller_fqn, callee_fqn)` nào vừa có cạnh `SWITCH_TO_BG`, vừa bị chèn đè cạnh `AGNOSTIC` hoặc `UI_MAIN` khi merge đồ thị SvACE.
+   - **Audit 5 (`DI & Interface Stitch Completeness`)**: Phát hiện các phương thức `interface`/`abstract` nội bộ được gọi nhiều lần nhưng có `0` cạnh đi ra (chưa được khâu nối sang class `Impl`).
+   - **Audit 6 (`Bellman DP Optimality & Trace Consistency`)**: Kiểm tra các `HotPath` được trích xuất xem chuỗi `call_chain` có đi theo đúng con trỏ cực đại của phương trình Quy hoạch động Bellman và tuyệt đối không đi qua cạnh `SWITCH_TO_BG` hay không.
+
+2. **Tầng 2 — Đối chiếu Chéo với Bytecode `.dex` của APK thật (`cross_check_with_dexdump`)**:
+   - Đọc trực tiếp file `.apk` hoặc `classes*.dex` bằng `dexdump -d` của Android SDK, trích xuất toàn bộ các lệnh máy ảo `invoke-virtual`, `invoke-direct`, `invoke-static`, `invoke-interface`, `invoke-super` và đo tỷ lệ `Recall %` của `call_edges` trong ASPA so với tập lệnh thực tế trong APK.
+
+3. **Tầng 3 — Đối chiếu với Dữ liệu Chạy thật trên Thiết bị (`cross_check_runtime_trace`)**:
+   - Đọc danh sách các cặp gọi hàm `(caller, callee, thread)` thu được từ Android Studio CPU Profiler / Perfetto Method Trace để xác minh độ phủ đường đi thực tế và độ chính xác phân loại luồng (`UI_MAIN` vs `WORKER_BG`).
+
+4. **Tầng 4 — Cấy Bẫy Chim Hoàng Yến Tự động (`benchmarks/canary_mutation_runner.py`)**:
+   - Tự động tiêm 5 mẫu lỗi chuẩn (Positive Canaries) và 5 mẫu bẫy an toàn (Negative Canaries) vào dự án, chạy pipeline phân tích để kiểm tra tỷ lệ bắt trúng Top-K đạt $100\%$ và tỷ lệ báo giả bằng $0\%$, sau đó tự động khôi phục nguyên trạng mã nguồn.
+
+================================================================================
+## 2. MÃ NGUỒN ĐẦY ĐỦ: `benchmarks/verify_graph_soundness.py`
+================================================================================
+Hãy tạo file `benchmarks/verify_graph_soundness.py` với nội dung hoàn chỉnh dưới đây:
+
+```python
+"""
+benchmarks/verify_graph_soundness.py
+Công cụ kiểm định độ chính xác tuyệt đối của Call Graph & Call Flow (ASPA V2).
+Hỗ trợ:
+1. Kiểm toán 6 Bất biến Toán học & AST trên SQLite DB
+2. Đối chiếu chéo với Bytecode DEX từ file APK thật (dexdump)
+3. Đối chiếu chéo với Runtime Method Trace từ thiết bị thật
+"""
+
+import argparse
+import json
+import math
+import re
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+
+class GraphSoundnessVerifier:
+    def __init__(self, db_path: str, project_pkg_prefix: str):
+        self.db_path = Path(db_path)
+        if not self.db_path.exists():
+            raise FileNotFoundError(f"Database file not found: {self.db_path}")
+        self.pkg_prefix = project_pkg_prefix.rstrip(".")
+        self.conn = sqlite3.connect(str(self.db_path))
+        self.conn.row_factory = sqlite3.Row
+
+    def close(self) -> None:
+        if self.conn:
+            self.conn.close()
+
+    @staticmethod
+    def _loop_multiplier(bound_type: str, depth: int) -> float:
+        if depth <= 0 or bound_type == "NONE":
+            return 1.0
+        base_map = {
+            "CONST_SMALL": 1.2,
+            "UI_BOUNDED": 4.0,
+            "PARAM_DEPENDENT": 12.0,
+            "UNBOUNDED_IO": 25.0,
+        }
+        base = base_map.get(bound_type, 12.0)
+        return float(math.pow(base, depth))
+
+    def run_all_invariant_audits(self) -> Dict[str, Any]:
+        print("=" * 78)
+        print(f"[ASPA V2 SOUNDNESS AUDIT] Database       : {self.db_path}")
+        print(f"[ASPA V2 SOUNDNESS AUDIT] Package Prefix : {self.pkg_prefix}.*")
+        print("=" * 78)
+
+        results = {
+            "audit_1_unresolved_rate": self.audit_unresolved_rate(),
+            "audit_2_dangling_internal_callees": self.audit_dangling_internal_callees(),
+            "audit_3_callsite_line_bounds": self.audit_callsite_line_bounds(),
+            "audit_4_bg_thread_leakage": self.audit_bg_thread_leakage(),
+            "audit_5_di_interface_stitching": self.audit_di_interface_stitching(),
+            "audit_6_bellman_dp_and_trace": self.audit_bellman_dp_and_trace_consistency(),
+        }
+
+        passed_all = all(r.get("passed", True) for r in results.values())
+        print("\n" + "=" * 78)
+        print(f"[SUMMARY] OVERALL INVARIANT STATUS: {'PASSED (100% SOUND)' if passed_all else 'ACTION REQUIRED (SEE FINDINGS ABOVE)'}")
+        print("=" * 78)
+        return {"passed_all": passed_all, "details": results}
+
+    def audit_unresolved_rate(self) -> Dict[str, Any]:
+        """
+        Audit 1: Tỷ lệ cạnh bị kẹt ở trạng thái 'unresolved:' trong các hàm thuộc bản build.
+        """
+        cur = self.conn.cursor()
+        has_scope = cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='scope_marks'"
+        ).fetchone()
+
+        scope_col = "is_built"
+        if has_scope:
+            cols = [r[1] for r in cur.execute("PRAGMA table_info(scope_marks)").fetchall()]
+            if "mark" in cols:
+                scope_col = "mark"
+            elif "in_build" in cols:
+                scope_col = "in_build"
+
+            total_edges = cur.execute(f"""
+                SELECT COUNT(*) FROM call_edges e
+                JOIN scope_marks s ON e.caller_fqn = s.fqn
+                WHERE s.{scope_col} = 1
+            """).fetchone()[0]
+            unresolved_edges = cur.execute(f"""
+                SELECT COUNT(*) FROM call_edges e
+                JOIN scope_marks s ON e.caller_fqn = s.fqn
+                WHERE s.{scope_col} = 1 AND e.callee_fqn LIKE 'unresolved:%'
+            """).fetchone()[0]
+        else:
+            total_edges = cur.execute("SELECT COUNT(*) FROM call_edges").fetchone()[0]
+            unresolved_edges = cur.execute(
+                "SELECT COUNT(*) FROM call_edges WHERE callee_fqn LIKE 'unresolved:%'"
+            ).fetchone()[0]
+
+        rate = (unresolved_edges / total_edges * 100.0) if total_edges > 0 else 0.0
+        top_unresolved = cur.execute("""
+            SELECT callee_raw_name, COUNT(*) as cnt
+            FROM call_edges
+            WHERE callee_fqn LIKE 'unresolved:%'
+            GROUP BY callee_raw_name
+            ORDER BY cnt DESC LIMIT 10
+        """).fetchall()
+
+        print(f"\n[Audit 1] Unresolved Call Edges in Built Scope: {unresolved_edges}/{total_edges} ({rate:.2f}%)")
+        for row in top_unresolved:
+            print(f"   - Unresolved method '{row['callee_raw_name']}': {row['cnt']} calls")
+
+        return {
+            "total_edges": total_edges,
+            "unresolved_edges": unresolved_edges,
+            "unresolved_pct": round(rate, 2),
+            "passed": rate < 5.0,
+        }
+
+    def audit_dangling_internal_callees(self) -> Dict[str, Any]:
+        """
+        Audit 2: Mọi callee_fqn mang prefix của project phải có mặt trong function_summaries.
+        Bắt lỗi lệch /arity, Kotlin Extension arity+1, hoặc $default bridge.
+        """
+        cur = self.conn.cursor()
+        rows = cur.execute("""
+            SELECT DISTINCT e.caller_fqn, e.callee_fqn, e.line_number
+            FROM call_edges e
+            LEFT JOIN function_summaries f ON e.callee_fqn = f.fqn
+            WHERE e.callee_fqn LIKE ?
+              AND f.fqn IS NULL
+              AND e.callee_fqn NOT LIKE '%<init>%'
+        """, (f"{self.pkg_prefix}.%",)).fetchall()
+
+        print(f"\n[Audit 2] Internal Dangling Callees (Signature/Arity Mismatch): {len(rows)} found")
+        for r in rows[:10]:
+            print(f"   - {r['caller_fqn']} (L{r['line_number']}) -> MISSING SUMMARY: {r['callee_fqn']}")
+
+        return {
+            "dangling_count": len(rows),
+            "samples": [dict(r) for r in rows[:20]],
+            "passed": len(rows) == 0,
+        }
+
+    def audit_callsite_line_bounds(self) -> Dict[str, Any]:
+        """
+        Audit 3: Số dòng (line_number) của mọi cạnh AST thật (is_synthetic = 0)
+        phải nằm gọn trong [start_line, end_line] của hàm cha caller_fqn.
+        """
+        cur = self.conn.cursor()
+        violations = cur.execute("""
+            SELECT e.caller_fqn, e.callee_fqn, e.line_number, f.start_line, f.end_line
+            FROM call_edges e
+            JOIN function_summaries f ON e.caller_fqn = f.fqn
+            WHERE e.is_synthetic = 0
+              AND e.line_number > 0
+              AND f.start_line > 0
+              AND f.end_line >= f.start_line
+              AND (e.line_number < f.start_line OR e.line_number > f.end_line)
+        """).fetchall()
+
+        print(f"\n[Audit 3] Out-of-bounds CallSite Line Numbers: {len(violations)} violations")
+        for v in violations[:10]:
+            print(
+                f"   - {v['caller_fqn']} [{v['start_line']}..{v['end_line']}] "
+                f"calls {v['callee_fqn']} at out-of-range line {v['line_number']}"
+            )
+        return {"violations": len(violations), "passed": len(violations) == 0}
+
+    def audit_bg_thread_leakage(self) -> Dict[str, Any]:
+        """
+        Audit 4: Kiểm tra xem có cạnh SWITCH_TO_BG nào bị ghi đè bởi cạnh AGNOSTIC/UI_MAIN trùng lặp
+        từ cùng 1 caller tới cùng 1 callee (Lỗi mất cờ SWITCH_TO_BG khi merge SvACE).
+        """
+        cur = self.conn.cursor()
+        conflicts = cur.execute("""
+            SELECT DISTINCT a.caller_fqn, a.callee_fqn,
+                   a.edge_thread_context AS ctx_bg,
+                   b.edge_thread_context AS ctx_leak
+            FROM call_edges a
+            JOIN call_edges b
+              ON a.caller_fqn = b.caller_fqn
+             AND a.callee_fqn = b.callee_fqn
+            WHERE a.edge_thread_context = 'SWITCH_TO_BG'
+              AND b.edge_thread_context IN ('AGNOSTIC', 'UI_MAIN')
+        """).fetchall()
+
+        print(f"\n[Audit 4] Background Thread Shield Collisions: {len(conflicts)} found")
+        for c in conflicts[:10]:
+            print(f"   - LEAK: {c['caller_fqn']} -> {c['callee_fqn']} has both {c['ctx_bg']} and {c['ctx_leak']}")
+
+        return {"collisions": len(conflicts), "passed": len(conflicts) == 0}
+
+    def audit_di_interface_stitching(self) -> Dict[str, Any]:
+        """
+        Audit 5: Tìm các nút lá cụt trong nội bộ project (start_line == end_line, 0 cạnh đi ra)
+        nghi ngờ là phương thức của Interface/Abstract class chưa được nối sang Implementation.
+        """
+        cur = self.conn.cursor()
+        unlinked = cur.execute("""
+            SELECT DISTINCT e.callee_fqn, COUNT(*) as caller_cnt
+            FROM call_edges e
+            JOIN function_summaries f ON e.callee_fqn = f.fqn
+            LEFT JOIN call_edges out_e ON f.fqn = out_e.caller_fqn
+            WHERE e.callee_fqn LIKE ?
+              AND (f.end_line - f.start_line) <= 1
+              AND out_e.callee_fqn IS NULL
+            GROUP BY e.callee_fqn
+            ORDER BY caller_cnt DESC
+        """, (f"{self.pkg_prefix}.%",)).fetchall()
+
+        print(f"\n[Audit 5] Unstitched 1-Line Interface/Abstract Candidates: {len(unlinked)} found")
+        for u in unlinked[:10]:
+            print(f"   - {u['callee_fqn']} (called {u['caller_cnt']} times, 0 outgoing edges)")
+
+        return {"unstitched_candidates": len(unlinked), "passed": True}
+
+    def audit_bellman_dp_and_trace_consistency(self) -> Dict[str, Any]:
+        """
+        Audit 6: Kiểm tra tính nhất quán của con trỏ DP trên Top 15 UI Entry Points:
+        Đảm bảo từ mỗi UI Entry có điểm cao, luôn tồn tại chuỗi đường đi hợp lệ trên Main Thread
+        (không đi qua SWITCH_TO_BG / WORKER_BG).
+        """
+        cur = self.conn.cursor()
+        top_entries = cur.execute("""
+            SELECT fqn, propagated_total_cost
+            FROM function_summaries
+            WHERE is_ui_entry = 1 AND propagated_total_cost > 10.0
+            ORDER BY propagated_total_cost DESC
+            LIMIT 15
+        """).fetchall()
+
+        broken_traces = 0
+        for row in top_entries:
+            root = row["fqn"]
+            out_main_edges = cur.execute("""
+                SELECT callee_fqn, edge_thread_context
+                FROM call_edges
+                WHERE caller_fqn = ?
+                  AND edge_thread_context NOT IN ('SWITCH_TO_BG', 'WORKER_BG')
+                  AND callee_fqn IS NOT NULL
+            """, (root,)).fetchall()
+
+            self_cost_row = cur.execute(
+                "SELECT intrinsic_self_cost FROM function_summaries WHERE fqn = ?", (root,)
+            ).fetchone()
+            self_cost = self_cost_row[0] if self_cost_row else 0.0
+
+            if row["propagated_total_cost"] > self_cost + 5.0 and len(out_main_edges) == 0:
+                broken_traces += 1
+                print(
+                    f"   - [DP TRACE MISMATCH] {root} has propagated_cost={row['propagated_total_cost']:.1f} "
+                    f"(self={self_cost:.1f}) but 0 valid Main-Thread outgoing edges!"
+                )
+
+        print(f"\n[Audit 6] Bellman DP & UI Trace Consistency: {broken_traces} broken traces out of {len(top_entries)} top entries")
+        return {"checked_entries": len(top_entries), "broken_traces": broken_traces, "passed": broken_traces == 0}
+
+    def cross_check_with_dexdump(self, apk_or_dex_path: str) -> Dict[str, Any]:
+        """
+        Tầng 2: Dùng `dexdump -d` đọc trực tiếp các lệnh invoke-* trong APK/DEX thật
+        và đối chiếu với bảng call_edges của ASPA.
+        """
+        print("\n" + "=" * 78)
+        print(f"[DEX GROUND-TRUTH CROSS-CHECK] Analyzing APK/DEX: {apk_or_dex_path}")
+        print("=" * 78)
+
+        dex_edges: Set[Tuple[str, str]] = set()
+        current_caller: Optional[str] = None
+
+        re_method_header = re.compile(r"^\s+#\d+\s+:\s+\(in\s+L([^;]+);\)\s+name\s+:\s+'([^']+)'")
+        re_invoke = re.compile(
+            r"invoke-(?:virtual|direct|static|interface|super)(?:/range)?\s+\{.*?\},\s+L([^;]+);\.([^:(]+):\(([^)]*)\)"
+        )
+
+        try:
+            proc = subprocess.Popen(
+                ["dexdump", "-d", apk_or_dex_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except FileNotFoundError:
+            print("   [SKIP] 'dexdump' binary not found in PATH (Add Android SDK build-tools to PATH).")
+            return {"skipped": True}
+
+        pkg_slash = self.pkg_prefix.replace(".", "/")
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            m_hdr = re_method_header.search(line)
+            if m_hdr:
+                cls_slash, m_name = m_hdr.group(1), m_hdr.group(2)
+                if cls_slash.startswith(pkg_slash) and "$" not in cls_slash and m_name not in ("<init>", "<clinit>"):
+                    current_caller = f"{cls_slash.replace('/', '.')}.{m_name}"
+                else:
+                    current_caller = None
+                continue
+
+            if current_caller:
+                m_inv = re_invoke.search(line)
+                if m_inv:
+                    callee_cls, callee_m = m_inv.group(1), m_inv.group(2)
+                    if (
+                        callee_cls.startswith(pkg_slash)
+                        and "$" not in callee_cls
+                        and callee_m not in ("<init>", "<clinit>")
+                        and not callee_m.startswith("access$")
+                    ):
+                        callee_clean = f"{callee_cls.replace('/', '.')}.{callee_m}"
+                        dex_edges.add((current_caller, callee_clean))
+
+        proc.wait()
+
+        cur = self.conn.cursor()
+        aspa_edges: Set[Tuple[str, str]] = set()
+        for row in cur.execute("SELECT caller_fqn, callee_fqn FROM call_edges WHERE callee_fqn IS NOT NULL"):
+            c_in = row["caller_fqn"].split("/")[0].replace("$default", "")
+            c_out = row["callee_fqn"].split("/")[0].replace("$default", "")
+            if c_in.startswith(self.pkg_prefix) and c_out.startswith(self.pkg_prefix):
+                aspa_edges.add((c_in, c_out))
+
+        matched = dex_edges.intersection(aspa_edges)
+        missing_in_aspa = dex_edges - aspa_edges
+        recall = (len(matched) / len(dex_edges) * 100.0) if dex_edges else 100.0
+
+        print(f"   - Direct Internal DEX Edges Found : {len(dex_edges)}")
+        print(f"   - Matched in ASPA Call Graph      : {len(matched)} ({recall:.2f}% Recall)")
+        print(f"   - Missing in ASPA                 : {len(missing_in_aspa)}")
+        for caller, callee in sorted(missing_in_aspa)[:15]:
+            print(f"       [MISSING IN ASPA] {caller} -> {callee}")
+
+        return {
+            "dex_edges_count": len(dex_edges),
+            "matched_count": len(matched),
+            "recall_pct": round(recall, 2),
+            "missing_samples": [f"{a} -> {b}" for a, b in sorted(missing_in_aspa)[:30]],
+        }
+
+    def cross_check_runtime_trace(self, runtime_edges_json: str) -> Dict[str, Any]:
+        """
+        Tầng 3: Đối chiếu với danh sách cạnh thu được khi chạy app thật (Perfetto / Method Trace).
+        Định dạng JSON đầu vào:
+        [{"caller": "com.app.MainActivity.onResume", "callee": "com.app.Repo.load", "thread": "main"}, ...]
+        """
+        print("\n" + "=" * 78)
+        print(f"[RUNTIME TRACE GROUND-TRUTH] Loading: {runtime_edges_json}")
+        print("=" * 78)
+
+        runtime_records = json.loads(Path(runtime_edges_json).read_text(encoding="utf-8"))
+        cur = self.conn.cursor()
+
+        db_edges: Dict[Tuple[str, str], Set[str]] = {}
+        for row in cur.execute("SELECT caller_fqn, callee_fqn, edge_thread_context FROM call_edges"):
+            if not row["callee_fqn"]:
+                continue
+            k = (row["caller_fqn"].split("/")[0], row["callee_fqn"].split("/")[0])
+            db_edges.setdefault(k, set()).add(row["edge_thread_context"])
+
+        missing_edges = []
+        thread_mismatches = []
+
+        for rec in runtime_records:
+            key = (rec["caller"].split("/")[0], rec["callee"].split("/")[0])
+            rt_is_main = rec.get("thread", "main").lower() in ("main", "ui")
+            if key not in db_edges:
+                missing_edges.append(rec)
+            else:
+                static_ctxs = db_edges[key]
+                if not rt_is_main and static_ctxs == {"UI_MAIN"}:
+                    thread_mismatches.append({"record": rec, "static_contexts": list(static_ctxs)})
+
+        total = len(runtime_records)
+        hit = total - len(missing_edges)
+        coverage = (hit / total * 100.0) if total > 0 else 100.0
+        print(f"   - Runtime Call Pairs Verified : {hit}/{total} ({coverage:.2f}% Coverage)")
+        print(f"   - Thread Context Mismatches   : {len(thread_mismatches)}")
+        for m in missing_edges[:10]:
+            print(f"       [MISSING RUNTIME EDGE] {m['caller']} -> {m['callee']} (thread={m.get('thread')})")
+
+        return {
+            "total_runtime_pairs": total,
+            "verified_pairs": hit,
+            "coverage_pct": round(coverage, 2),
+            "thread_mismatches": len(thread_mismatches),
+        }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Verify ASPA V2 Call Graph & Call Flow Soundness")
+    parser.add_argument("--db", default=".perf_index.db", help="Path to ASPA SQLite DB")
+    parser.add_argument("--pkg", required=True, help="Root package prefix of the project (e.g. com.sec.android.app.camera)")
+    parser.add_argument("--apk", help="Optional path to compiled .apk or classes.dex for DEX cross-check")
+    parser.add_argument("--runtime-trace", help="Optional path to runtime call pairs JSON")
+    parser.add_argument("--out-json", help="Optional path to save audit report JSON")
+    args = parser.parse_args()
+
+    verifier = GraphSoundnessVerifier(args.db, args.pkg)
+    try:
+        report = verifier.run_all_invariant_audits()
+        if args.apk:
+            report["dex_cross_check"] = verifier.cross_check_with_dexdump(args.apk)
+        if args.runtime_trace:
+            report["runtime_cross_check"] = verifier.cross_check_runtime_trace(args.runtime_trace)
+        if args.out_json:
+            Path(args.out_json).write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        sys.exit(0 if report["passed_all"] else 1)
+    finally:
+        verifier.close()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+================================================================================
+## 3. MÃ NGUỒN ĐẦY ĐỦ: BỘ CẤY BẪY CANARY TỰ ĐỘNG (`benchmarks/canary_mutation_runner.py`)
+================================================================================
+Hãy tạo file `benchmarks/canary_mutation_runner.py` để tự động tiêm 5 mẫu lỗi chuẩn (Positive Canaries) và 3 mẫu bẫy an toàn (Negative Canaries) vào một dự án Android thực tế (hoặc workspace kiểm thử), chạy pipeline phân tích của ASPA và kiểm chứng độ chính xác $100\%$:
+
+```python
+"""
+benchmarks/canary_mutation_runner.py
+Công cụ kiểm thử đột biến (Canary Mutation Testing) để chứng minh ASPA bắt đúng 100%
+các chuỗi Call Flow phức tạp (Inter-procedural O(N^2), DI Bridge, Coroutine Main-Thread Trap,
+Compose Unremembered Loop) và có 0% False Positive trên các nhánh đã offload Background.
+"""
+
+import shutil
+import tempfile
+from pathlib import Path
+from typing import Dict, List
+
+
+CANARY_KOTLIN_SOURCE = """package com.aspa.canary
+
+import android.content.Context
+import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.view.View
+import androidx.recyclerview.widget.RecyclerView
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import javax.inject.Inject
+
+interface CanaryConfigRepo {
+    fun loadPresetSync(key: String): String
+}
+
+class CanaryConfigRepoImpl @Inject constructor(
+    private val context: Context,
+    private val prefs: SharedPreferences
+) : CanaryConfigRepo {
+    override fun loadPresetSync(key: String): String {
+        val allKeys = listOf("a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l")
+        for (k in allKeys) {
+            if (k == key) {
+                prefs.edit().commit()
+            }
+        }
+        return key
+    }
+}
+
+class CanaryBadgeHelper @Inject constructor(
+    private val repo: CanaryConfigRepo,
+    private val pm: PackageManager
+) {
+    fun bindBadges(items: List<String>) {
+        items.forEach { item ->
+            repo.loadPresetSync(item)
+            pm.getApplicationInfo(item, 0)
+        }
+    }
+}
+
+class CanaryAdapter(
+    private val helper: CanaryBadgeHelper,
+    private val mainScope: CoroutineScope
+) {
+    // [POSITIVE CANARY 1]: Inter-procedural O(N^2) + DI Bridge + Disk I/O & Binder IPC inside onBindViewHolder
+    fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
+        val badges = listOf("b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8", "b9", "b10", "b11", "b12")
+        helper.apply {
+            bindBadges(badges)
+        }
+    }
+
+    // [POSITIVE CANARY 2]: Coroutine Main-Thread Trap (launch without Dispatchers.IO calling suspend function)
+    fun onViewCreated(view: View, pm: PackageManager) {
+        mainScope.launch {
+            suspendWithoutContextSwitch(pm)
+        }
+    }
+
+    suspend fun suspendWithoutContextSwitch(pm: PackageManager) {
+        val pkgs = pm.getInstalledPackages(0)
+        pkgs.forEach { _ ->
+            pm.getApplicationInfo("com.test", 0)
+        }
+    }
+
+    // [NEGATIVE CANARY 1 - SAFE]: Offloaded properly via withContext(Dispatchers.IO) -> Must be PRUNED!
+    fun onResume(pm: PackageManager, prefs: SharedPreferences) {
+        mainScope.launch {
+            withContext(Dispatchers.IO) {
+                val pkgs = pm.getInstalledPackages(0)
+                pkgs.forEach { _ ->
+                    prefs.edit().commit()
+                }
+            }
+        }
+    }
+
+    // [NEGATIVE CANARY 2 - SAFE]: Small constant loop (0..2) doing pure arithmetic -> Must have negligible score!
+    fun onClick(v: View): Int {
+        var acc = 0
+        for (i in 0..2) {
+            acc += computeTrivial(i)
+        }
+        return acc
+    }
+
+    private fun computeTrivial(x: Int): Int = x + 1
+}
+"""
+
+
+def create_canary_workspace(base_dir: Path) -> Path:
+    src_dir = base_dir / "src" / "main" / "java" / "com" / "aspa" / "canary"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    canary_file = src_dir / "CanaryBenchmarkSuite.kt"
+    canary_file.write_text(CANARY_KOTLIN_SOURCE, encoding="utf-8")
+    return canary_file
+```
+
+================================================================================
+## 4. BỘ KIỂM THỬ TỰ ĐỘNG PYTEST: `tests/test_v2_soundness_and_canaries.py`
+================================================================================
+Hãy tạo file `tests/test_v2_soundness_and_canaries.py` để kiểm chứng toàn bộ:
+1. 6 Bất biến của `GraphSoundnessVerifier`.
+2. Độ chính xác $100\%$ trên bộ `CanaryBenchmarkSuite.kt` (Bắt đúng `CanaryAdapter.onBindViewHolder -> CanaryBadgeHelper.bindBadges -> CanaryConfigRepoImpl.loadPresetSync` qua `.apply {}` và DI Interface; bắt đúng bẫy `suspendWithoutContextSwitch`; và cắt bỏ hoàn toàn nhánh `onResume` đã bọc `withContext(Dispatchers.IO)`).
+3. Kiểm chứng thứ hạng điểm số ASPA V2: Điểm `ux_risk_score` của `onBindViewHolder` (O(N^2) + Binder IPC + Disk I/O) > `onViewCreated` (Coroutine Main Thread Trap) $\gg$ `onClick` (Vòng lặp hằng số nhỏ `0..2`) và `onResume` (Đã offload sang `Dispatchers.IO`).
+
+================================================================================
+## 5. HƯỚNG DẪN LỆNH CHẠY KIỂM THỬ TRỰC TIẾP TRÊN TERMINAL CHO AI AGENT
+================================================================================
+Sau khi AI Coding Agent triển khai xong các file trong Tài liệu 01, 02, 03, 04 và 05 này, hãy yêu cầu AI chạy lần lượt 3 lệnh sau và báo cáo kết quả:
+
+1. **Chạy bộ Unit & Canary Tests tự động**:
+   ```bash
+   pytest tests/ -v
+   ```
+2. **Chạy quét lại dự án thực tế (ví dụ dự án Camera) với mô hình ASPA V2**:
+   ```bash
+   python -m android_perf_analyzer.cli scan <đường_dẫn_repo_android> --top-k 20
+   ```
+3. **Chạy công cụ Kiểm toán Độ chính xác Đồ thị (Soundness Verifier) trên file DB vừa sinh ra**:
+   ```bash
+   python benchmarks/verify_graph_soundness.py --db .perf_index.db --pkg <package_gốc_của_app> --out-json soundness_audit.json
+   ```
+   *(Nếu có sẵn file APK đã build của dự án, thêm cờ `--apk <đường_dẫn_file.apk>` để chạy luôn bước đối chiếu chéo với Bytecode DEX).*

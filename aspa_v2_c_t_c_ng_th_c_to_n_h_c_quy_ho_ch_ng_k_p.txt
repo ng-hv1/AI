@@ -1,0 +1,109 @@
+# TÀI LIỆU 03: ĐẶC TẢ MÔ HÌNH TOÁN HỌC CHẤM ĐIỂM ASPA V2 & QUY HOẠCH ĐỘNG KÉP (DUAL-METRIC DP)
+(Dùng để đưa cho AI nâng cấp các file: `core/models.py`, `core/stitcher.py`, `core/summary_engine.py`)
+
+Hãy đóng vai Principal Algorithm & Performance Architect. Hãy nâng cấp toàn bộ mô hình tính điểm hiệu năng và thuật toán trích xuất Hot Path trong `core/models.py`, `core/stitcher.py` và `core/summary_engine.py` theo đúng các phương trình toán học của **ASPA V2** dưới đây.
+
+================================================================================
+## 1. CẬP NHẬT DATA MODELS (`core/models.py`)
+================================================================================
+Bổ sung các trường sau vào `FunctionSummary` và `HotPath`:
+- Trong `FunctionSummary`:
+  - `intrinsic_self_cost: float = 0.05` (Chi phí nền của hàm thường là `0.05` thay vì `1.0`)
+  - `max_path_cost: float = 0.0` (Chi phí của đường đi đơn lẻ nặng nhất từ hàm này xuống nút lá)
+  - `damped_subtree_cost: float = 0.0` (Tổng chi phí cây con có giảm chấn $0.35$ cho các nhánh phụ)
+  - `best_callee_fqn: Optional[str] = None` (Con trỏ DP trỏ tới hàm con tạo ra `max_path_cost` lớn nhất)
+- Trong `HotPath`:
+  - `max_path_cost: float = 0.0`
+  - `damped_subtree_cost: float = 0.0`
+  - `synergy_multiplier: float = 1.0`
+  - `active_synergy_flags: List[str] = field(default_factory=list)`
+  - `build_scope_multiplier: float = 1.0`
+  - `hop_edges_metadata: List[Dict[str, Any]] = field(default_factory=list)` (Lưu thông tin chi tiết của từng bước nhảy `Hop i -> Hop i+1` để cung cấp cho Gemini CLI và HTML Reporter).
+
+================================================================================
+## 2. CÔNG THỨC TÍNH CHI PHÍ NỘI TẠI `SelfCost(u)` (`core/stitcher.py`)
+================================================================================
+Trong `apply_entrypoints_and_sinks()`, chi phí nội tại của hàm $u$ được tính bằng công thức:
+
+$$\text{SelfCost}(u) = \epsilon_{\text{cpu}} + \sum_{s \in \text{Sinks}(u)} \Big( \text{BaseSinkCost}(s) \times M(b_s, d_s) \Big) + \text{InternalLoopAlgoCost}(u)$$
+
+### Chi tiết từng thành phần:
+1. **Chi phí CPU cơ sở ($\epsilon_{\text{cpu}}$)**:
+   $$\epsilon_{\text{cpu}} = 0.05$$
+   *(Giúp 100 hàm getter/setter thông thường cộng lại chỉ bằng `5.0`, không bao giờ vượt qua được một hàm gọi Sink thật sự).*
+
+2. **Bảng Hệ số Nhân Cận Vòng lặp $M(b, d)$**:
+   Hàm phụ trợ `get_loop_multiplier(bound_type: LoopBoundType, depth: int) -> float`:
+   - Nếu `depth <= 0` hoặc `bound_type == LoopBoundType.NONE`: trả về `1.0`
+   - `LoopBoundType.CONST_SMALL`: trả về $1.2^{\text{depth}}$
+   - `LoopBoundType.UI_BOUNDED`: trả về $4.0^{\text{depth}}$
+   - `LoopBoundType.PARAM_DEPENDENT`: trả về $12.0^{\text{depth}}$
+   - `LoopBoundType.UNBOUNDED_IO`: trả về $25.0^{\text{depth}}$
+
+3. **Khuếch đại Sink Nội hàm theo Vòng lặp tại Điểm gọi ($\text{BaseSinkCost}(s) \times M(b_s, d_s)$)**:
+   - Khi một `call_site` trong thân hàm $u$ khớp với một mẫu trong `android_sinks.json` (và `call_site.edge_thread_context != ThreadContext.SWITCH_TO_BG`):
+   - Nếu danh mục Sink có `"requires_loop": true` mà `call_site.local_loop_depth == 0` và hàm $u$ không phải là hàm chạy lặp theo khung hình (`onDraw`, `onBindViewHolder`, `@Composable`): bỏ qua không cộng Sink đó.
+   - Ngược lại, điểm cộng vào `SelfCost(u)` của Sink đó là:
+     `sink_contribution = base_sink_cost * get_loop_multiplier(call_site.loop_bound_type, call_site.local_loop_depth)`
+     *(Lưu ý: Nếu `call_site` gọi Sink nằm ngay trong vòng lặp `for` của hàm $u$, chi phí của Sink đó phải được nhân với hệ số vòng lặp ngay tại hàm $u$!).*
+
+4. **Chi phí Thuật toán Vòng lặp Nội hàm ($\text{InternalLoopAlgoCost}(u)$)**:
+   - Để bắt các hàm nút lá tự viết thuật toán $O(N^2), O(N^3)$ bằng vòng lặp lồng nhau mà không gọi hàm con nào khác:
+   - Nếu `u.max_internal_loop_depth == 0`: `0.0`
+   - Nếu `u.max_internal_loop_depth == 1`: `1.5`
+   - Nếu `u.max_internal_loop_depth >= 2`:
+     $$\text{InternalLoopAlgoCost}(u) = 5.0 \times 12.0^{(\text{max\_internal\_loop\_depth} - 1)}$$
+
+================================================================================
+## 3. QUY HOẠCH ĐỘNG KÉP TRÊN CODE GRAPH (`core/summary_engine.py`)
+================================================================================
+Trong `BottomUpSummaryEngine.run_bottom_up_propagation()`:
+
+### Bước 1: Tarjan SCC & Xử lý Chu trình Đệ quy
+- Chỉ nạp các cạnh có `edge_thread_context != ThreadContext.SWITCH_TO_BG` và `edge_thread_context != ThreadContext.WORKER_BG`.
+- Chạy thuật toán Tarjan tìm các thành phần liên thông mạnh (SCC).
+- Nếu `len(scc) > 1` hoặc có cạnh tự gọi `u -> u`: gắn `is_recursive = True` cho mọi hàm trong SCC.
+
+### Bước 2: Tính `MaxPathCost(u)`, `DampedSubtreeCost(u)` và Con trỏ `best_next_edge[u]`
+Duyệt các SCC theo thứ tự Tô-pô ngược (từ nút lá lên nút gốc UI):
+Với mỗi hàm $u$, xét tất cả các cạnh hợp lệ trên Main Thread $e = (u \to v)$ đi ra từ $u$:
+1. Tính đóng góp đường đi của từng cạnh $e = (u \to v)$:
+   $$\text{BranchPathCost}(e) = M(\text{loop\_bound\_type}(e), \text{local\_loop\_depth}(e)) \times \text{MaxPathCost}(v)$$
+2. Chọn cạnh $e^*$ có $\text{BranchPathCost}(e^*)$ lớn nhất:
+   - Lưu `best_next_edge[u] = e^*` (và lưu danh sách các cạnh đã sắp xếp giảm dần theo `BranchPathCost` vào `sorted_out_edges[u]`).
+   - Tính:
+     $$\text{MaxPathCost}(u) = \text{SelfCost}(u) + \text{BranchPathCost}(e^*)$$
+3. Tính `DampedSubtreeCost(u)` (Giảm chấn Fan-Out $\gamma = 0.35$):
+   Giả sử các cạnh đi ra đã sắp xếp giảm dần là $e_1, e_2, \dots, e_k$:
+   $$\text{DampedSubtreeCost}(u) = \text{SelfCost}(u) + \text{BranchPathCost}(e_1) + 0.35 \times \sum_{i=2}^{k} \text{BranchPathCost}(e_i)$$
+4. Tính `max_accumulated_loop_depth[u]`:
+   $$\text{AccLoopDepth}(u) = \max\Big( \text{max\_internal\_loop\_depth}(u), \max_{e=(u \to v)} \big( \text{local\_loop\_depth}(e) + \text{AccLoopDepth}(v) \big) \Big)$$
+5. Nếu `u.is_recursive == True`:
+   - Nhân `MaxPathCost(u) *= 8.0` và `DampedSubtreeCost(u) *= 8.0`.
+   - Cộng `AccLoopDepth(u) += 1`.
+6. Gán `u.propagated_total_cost = 0.7 * MaxPathCost(u) + 0.3 * DampedSubtreeCost(u)`.
+
+================================================================================
+## 4. TRUY VẾT CALL FLOW CHÍNH XÁC & NHÂN HỆ SỐ CỘNG HƯỞNG (`extract_top_hot_paths`)
+================================================================================
+
+### 4.1. Truy vết bằng Con trỏ DP (`_trace_witness_path`)
+- Xuất phát từ hàm gốc $v_0$, đi theo chuỗi con trỏ `best_next_edge[curr]` đã lưu ở Bước 2 (dùng tập `visited` trên đường đi hiện tại để dừng ngay khi chạm chu trình SCC hoặc chạm nút lá).
+- **Tuyệt đối không bao giờ đi qua cạnh `SWITCH_TO_BG`**.
+- Để lấy thêm các nhánh đa dạng (`pick_diverse`) từ cùng một Root $v_0$, có thể rẽ nhánh ở cạnh tốt thứ 2 (`sorted_out_edges[v_0][1]`) nếu `BranchPathCost` của cạnh thứ 2 vẫn lớn hơn ngưỡng tối thiểu (`>= 50.0`), sau đó tiếp tục đi theo `best_next_edge` xuống nút lá.
+
+### 4.2. Tính Điểm Rủi ro của Từng Call Flow $\pi = (v_0 \xrightarrow{e_0} v_1 \dots \xrightarrow{e_{k-1}} v_k)$
+Với mỗi chuỗi Call Flow $\pi$ trích xuất được, tính chi phí thực của chính đường đi $\pi$ đó:
+1. Tính độ sâu vòng lặp tích lũy tại từng nút $v_i$ dọc theo đường đi $\pi$:
+   - $\text{depth\_at}(v_0) = 0$
+   - $\text{depth\_at}(v_{i}) = \text{depth\_at}(v_{i-1}) + \text{local\_loop\_depth}(e_{i-1})$
+2. Tính **Hệ số Cộng hưởng Điểm nghẽn $\Psi_{\text{synergy}}(\pi)$** (khởi tạo `synergy = 1.0`):
+   - **Cờ 1: `SINK_INSIDE_LOOP` ($\times 2.5$)**: Kích hoạt nếu bất kỳ nút $v_i$ nào trên $\pi$ có chứa Heavy Sink VÀ ($\text{depth\_at}(v_i) \ge 1$ hoặc bản thân Sink nằm trong vòng lặp nội bộ của $v_i$).
+   - **Cờ 2: `SUPERLINEAR_ALGORITHMIC_CHAIN` ($\times 2.2$)**: Kích hoạt nếu tổng độ sâu vòng lặp dọc theo đường đi $\pi$ (cộng cả `max_internal_loop_depth` của nút lá) $\ge 2$ VÀ có ít nhất 2 cấp vòng lặp thuộc loại `PARAM_DEPENDENT` hoặc `UNBOUNDED_IO`.
+   - **Cờ 3: `RENDER_PATH_VIOLATION` ($\times 2.0$)**: Kích hoạt nếu gốc $v_0$ thuộc nhóm `RENDER_AND_SCROLL_CRITICAL` (`entry_weight == 5.0`) VÀ đường đi $\pi$ có chứa ít nhất 1 Heavy Sink hoặc có tổng độ sâu vòng lặp $\ge 2$.
+   - **Cờ 4: `CROSS_THREAD_LOCK_CONTENTION` ($\times 3.0$)**: Kích hoạt nếu bất kỳ hàm $v_i$ nào trên $\pi$ giữ khóa `synchronized` / `by lazy` nằm trong danh sách tranh chấp khóa với Background Thread.
+3. Tính **Hệ số Tin cậy Build Scope $\Omega_{\text{build}}(\pi)$**:
+   - Nếu `not_in_build_nodes` của $\pi$ rỗng (mọi hàm đều có `scope_marks == 1`): $\Omega_{\text{build}}(\pi) = 1.0$.
+   - Nếu có bất kỳ hàm nào trên $\pi$ thuộc `NOT_IN_BUILD` (`scope_marks == 0`): $\Omega_{\text{build}}(\pi) = 0.2$.
+4. **Công thức Điểm Cuối cùng của Call Flow $\pi$**:
+   $$\text{UX\_Risk\_Score}(\pi) = \text{EntryWeight}(v_0) \times \text{PathCost}(\pi) \times \Psi_{\text{synergy}}(\pi) \times \Omega_{\text{build}}(\pi)$$

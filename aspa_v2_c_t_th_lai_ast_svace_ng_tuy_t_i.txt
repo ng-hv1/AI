@@ -1,0 +1,93 @@
+# TÀI LIỆU 02: ĐẶC TẢ NÂNG CẤP CALL GRAPH & HYBRID SVACE REFINER ĐẠT ĐỘ CHÍNH XÁC TIỆM CẬN 100%
+(Dùng để đưa cho AI nâng cấp các file: `core/parser.py`, `core/symbol_resolver.py`, `core/hybrid_resolver.py`, `core/stitcher.py`, `core/store.py`)
+
+Hãy đóng vai Principal Program Analysis Architect. Hãy nâng cấp các module xây dựng Call Graph trong `android_perf_analyzer` theo đúng đặc tả chi tiết dưới đây để khắc phục toàn bộ điểm mù giữa AST và SvACE Bytecode.
+
+================================================================================
+## 1. NÂNG CẤP `core/parser.py`: SCOPE SPANS, KOTLIN SCOPE FUNCTIONS, JNI, BY LAZY & COMPOSE
+================================================================================
+
+### 1.1. Lưu Vùng Ngữ cảnh theo Dòng (`ASTScopeSpan`) cho từng Hàm
+Trong Pass 2 (`parse_source`), bên cạnh việc thu thập `List[CallSite]`, với mỗi hàm `caller_fqn`, hãy lưu thêm cấu trúc `FunctionScopeProfile`:
+```python
+@dataclass
+class LoopSpan:
+    start_line: int
+    end_line: int
+    depth: int
+    bound_type: LoopBoundType
+
+@dataclass
+class ThreadSpan:
+    start_line: int
+    end_line: int
+    thread_context: ThreadContext
+```
+- **Mục đích**: Khi `hybrid_resolver.py` hợp nhất một cạnh gọi hàm từ SvACE (hoặc khôi phục cạnh `unresolved:`) mà có thông tin dòng hoặc ánh xạ về hàm bao ngoài, hệ thống có thể tra cứu `LoopSpan` và `ThreadSpan` để biết chính xác cạnh đó có nằm trong vùng `SWITCH_TO_BG` (`withContext(Dispatchers.IO)`) hay vùng vòng lặp hay không!
+
+### 1.2. Giải quyết Kotlin Scope Functions (`.apply`, `.run`, `.let`, `.also`, `with`)
+Trong `_collect_kotlin_calls()`:
+- Duy trì một ngăn xếp `scope_receiver_stack: List[str]` lưu kiểu dữ liệu `T` của đối tượng gọi scope function:
+  1. Khi gặp `receiverExpr.apply { ... }`, `receiverExpr.run { ... }`, hoặc `with(receiverExpr) { ... }`:
+     - Phân giải kiểu `T` của `receiverExpr` (qua `local_vars`, `param_types`, `fields`, hoặc kiểu trả về của hàm).
+     - Đẩy `T` vào `scope_receiver_stack` trước khi duyệt thân lambda, và `pop()` khi thoát khỏi lambda.
+     - Mọi lời gọi hàm không có receiver tường minh (`foo()`) bên trong khối lambda sẽ ưu tiên tra cứu phương thức `foo` trên kiểu `T` ở đỉnh `scope_receiver_stack` trước khi tra cứu trên class hiện tại.
+  2. Khi gặp `receiverExpr.let { param -> ... }` hoặc `receiverExpr.also { param -> ... }`:
+     - Gán kiểu `T` của `receiverExpr` cho tên biến `param` (hoặc biến mặc định `"it"` nếu lambda không khai báo tên tham số) trong từ điển `local_vars` của phạm vi lambda đó.
+
+### 1.3. Phát hiện Hàm Native / JNI (`external fun` / `native`)
+- Khi duyệt `method_declaration` (Java) hoặc `function_declaration` (Kotlin):
+  - Nếu danh sách modifiers chứa `native` (Java) hoặc `external` (Kotlin):
+  - Vì hàm C/C++ không có thân hàm trong Java/Kotlin nên AST và SvACE không thấy các lệnh bên trong. Hãy tự động thêm `"JNI_NATIVE_CALL"` vào `summary.detected_sinks` và cộng `60.0` vào `summary.intrinsic_self_cost`.
+
+### 1.4. Phát hiện Khóa Đồng bộ Ẩn của Kotlin `by lazy { ... }`
+- Trong `extract_synchronized_locks()`:
+  - Ngoài khối `synchronized(lock)` và `@Synchronized`, khi gặp khai báo thuộc tính Kotlin `val propName by lazy { ... }` (mà không truyền tham số `LazyThreadSafetyMode.NONE` hay `PUBLICATION`):
+  - Ghi nhận khóa đồng bộ tên là `"lazy:<ClassFQN>.<propName>"` và coi các lời gọi hàm bên trong khối `lazy { ... }` là đang giữ khóa đó để `detect_lock_contention()` phát hiện nguy cơ ANR khi cả Main Thread và Worker Thread cùng truy cập thuộc tính `lazy` lần đầu.
+
+### 1.5. Phát hiện Bão Recomposition trong Jetpack Compose (`@Composable`)
+- Nếu một hàm Kotlin có gắn annotation `@Composable`:
+  - Đánh dấu `is_ui_entry = True`, `entry_weight = 5.0`.
+  - Khi duyệt các lời gọi hàm bên trong thân hàm `@Composable` đó, nếu gặp các toán tử biến đổi tập hợp hoặc khởi tạo nặng (`sortedBy`, `sortedWith`, `filter`, `map`, `distinctBy`, `groupBy`, `Regex`, `Pattern.compile`) mà trên đường đi tổ tiên (`node.parent`) **KHÔNG** nằm bên trong khối lambda của `remember { ... }` hoặc `derivedStateOf { ... }`:
+  - Tự động gắn cờ sink `"UNREMEMBERED_COMPOSE_COMPUTATION"` (`sink_cost = 45.0`) vào `FunctionSummary` của hàm `@Composable` đó.
+
+================================================================================
+## 2. NÂNG CẤP `core/hybrid_resolver.py`: 5 QUY TẮC CHUẨN HÓA BYTECODE & BẢO TOÀN NGỮ CẢNH
+================================================================================
+
+### 2.1. Hàm Chuẩn hóa Ký hiệu Bytecode SvACE (`_normalize_bytecode_symbol`)
+Giữa Bytecode của SvACE và Source AST của `SymbolTable` có 5 sự lệch pha kinh điển. Hãy viết bộ chuẩn hóa xử lý triệt để:
+
+1. **Kotlin Coroutine `SuspendLambda` & Anonymous Inner Classes**:
+   - Trong SvACE JSON, các khối `launch { ... }`, `async { ... }`, `withContext(...) { ... }` hoặc lambda lồng nhau có tên class dạng:
+     `com.example.MyViewModel$loadDashboard$1` hoặc `com.example.MyViewModel$loadDashboard$1$2`
+     và tên phương thức là `invokeSuspend`, `invoke`, hoặc `emit`.
+   - **Quy tắc ánh xạ**: Dùng Regex `^([a-zA-Z0-9_.]+)\$([a-zA-Z0-9_]+)\$\d+.*$` tách lấy `outer_class = group(1)` và `enclosing_method = group(2)`. Quy toàn bộ các cạnh xuất phát từ class/method tổng hợp này về hàm bao ngoài `outer_class.enclosing_method` trong `SymbolTable`!
+
+2. **Hàm có Tham số Mặc định của Kotlin (`$default`)**:
+   - Nếu `callee_method` trong SvACE kết thúc bằng `"$default"` (ví dụ `fetchData$default`), hãy cắt bỏ hậu tố `"$default"` để lấy tên hàm gốc `fetchData`.
+   - Khi khớp `arity`: hàm `$default` trong bytecode luôn có `arity_bytecode = arity_source + 1 + ceil(arity_source / 32.0)`. Hãy khớp nó về phương thức `fetchData/arity_source` tương ứng trong `SymbolTable`.
+
+3. **Lệch `arity + 1` ở Kotlin Extension Function**:
+   - Một hàm mở rộng `fun String.parseCustom(flag: Int)` trên AST có `arity = 1`, nhưng trong bytecode SvACE nó là hàm static `parseCustom(String, int)` có `arity = 2`.
+   - Khi tra cứu `(callee_class, callee_method, svace_arity)` trong `SymbolTable`: nếu không tìm thấy `arity == svace_arity`, hãy tự động kiểm tra `arity == svace_arity - 1`.
+
+4. **Hàm Cầu nối `access$` và `$$Nest$m`**:
+   - Nếu SvACE có chuỗi gọi `Caller -> OuterClass.access$doSecretWork -> OuterClass.doSecretWork`, trong `bridge_lambdas()` hãy bắc cầu xuyên qua mọi phương thức bắt đầu bằng `access$` hoặc `$$Nest$` để nối trực tiếp `Caller -> OuterClass.doSecretWork`.
+
+### 2.2. Hợp nhất Bảo toàn Ngữ cảnh AST & Chốt chặn `SWITCH_TO_BG`
+Trong `refine()` và `bridge_lambdas()` của `HybridGraphRefiner`:
+1. **Ưu tiên Cập nhật Cạnh `unresolved:` tại chỗ (In-place Edge Rewrite)**:
+   - Khi SvACE có cạnh `(caller_fqn, callee_class, callee_method)`, trước khi insert cạnh mới vào bảng `call_edges`, hãy tìm các cạnh hiện có của `caller_fqn` trong `call_edges` mà có `callee_raw_name == callee_method` và `callee_fqn` đang là `"unresolved:..."` (hoặc đang trỏ vào một Interface cha của `callee_class`).
+   - Cập nhật trực tiếp `callee_fqn = resolved_svace_fqn` ngay trên dòng đó. Cách này giúp giữ lại 100% `line_number`, `local_loop_depth`, `loop_bound_type` và `edge_thread_context` mà Tree-sitter đã đo được!
+2. **Chốt chặn Chống Hồi sinh Nhánh Background (`SWITCH_TO_BG` Shield)**:
+   - Trước khi union (chèn mới) một cạnh `(caller_fqn -> target_fqn)` từ SvACE vào `call_edges`:
+   - Kiểm tra xem trong `call_edges` của `caller_fqn` đã có cạnh nào gọi tới `target_fqn` (hoặc cùng `callee_raw_name`) mang `edge_thread_context == ThreadContext.SWITCH_TO_BG` chưa, hoặc toàn bộ các lệnh gọi `callee_raw_name` trong `caller_fqn` đều nằm trong `ThreadSpan` loại `SWITCH_TO_BG` hay không.
+   - Nếu CÓ: **Tuyệt đối không chèn thêm cạnh `AGNOSTIC` hay `UI_MAIN` từ SvACE** (tránh làm sống lại nhánh đã được đẩy xuống Background Thread).
+
+================================================================================
+## 3. NÂNG CẤP `core/store.py`: LƯU CACHE `SymbolTable` CHO `diff-scan` SIÊU TỐC
+================================================================================
+- Thêm bảng `file_symbol_cache (file_path TEXT PRIMARY KEY, mtime REAL, symbols_json TEXT)` vào `SummaryStore`.
+- Trong `run_full_scan`, lưu các `ClassSymbol` và `top_level_functions` của từng file vào `file_symbol_cache`.
+- Trong `run_diff_scan`, thay vì phải `os.walk` và parse lại toàn bộ hàng nghìn file ở Pass 1, hãy nạp thẳng `SymbolTable` từ `file_symbol_cache` trong SQLite lên RAM, và chỉ parse lại đúng các file nằm trong `changed_files` (hoặc có `mtime` thay đổi). Sau khi cập nhật cạnh của `dirty_functions`, chạy `HybridGraphRefiner.refine()` cục bộ trên các `dirty_functions` để không làm mất kết quả vá cạnh của SvACE.

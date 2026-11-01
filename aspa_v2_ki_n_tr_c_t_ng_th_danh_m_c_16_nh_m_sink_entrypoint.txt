@@ -1,0 +1,384 @@
+# TÀI LIỆU 01: KIẾN TRÚC TỔNG THỂ ASPA V2 & CẤU HÌNH ĐẦY ĐỦ 16 NHÓM PERFORMANCE ISSUES
+(Dùng làm System Context và cập nhật trực tiếp 2 file `config/android_entrypoints.json`, `config/android_sinks.json`)
+
+================================================================================
+## 1. BỨC TRANH TOÀN CẢNH HỆ THỐNG ASPA V2 (9 GIAI ĐOẠN KHÉP KÍN)
+================================================================================
+Hệ thống **ASPA V2 (Android Static Performance Analyzer)** là công cụ phân tích tĩnh lai Neuro-Symbolic (Tree-sitter AST + SvACE Bytecode Graph + Quy hoạch động Kép + Gemini CLI CEGAR & QA Test Generator).
+
+### Luồng chạy 9 giai đoạn (`run_full_scan` & `run_diff_scan`):
+1. **B1 - SvACE Bytecode Ground-Truth (`svace_runner.py`)**: Build intercept Gradle để lấy đồ thị gọi hàm ở cấp Bytecode và đánh dấu `scope_marks` (`1 = BUILT`, `0 = NOT_IN_BUILD`).
+2. **B2 - Pass 1 Fast Signature Indexing (`parser.py` & `symbol_resolver.py`)**: Quét nhanh chữ ký class, method/arity, fields, kế thừa, imports và lưu cache vào bảng `symbol_table_cache` trong SQLite.
+3. **B3 - Pass 2 Deep AST & Scope Spans (`parser.py`)**: Thu thập `FunctionSummary`, `CallSite`, vùng vòng lặp (`loop_spans`), vùng luồng (`thread_spans`), ngăn xếp Kotlin Scope Functions (`scope_receiver_stack`), khóa `synchronized` + `by lazy`, hàm `native/external` (JNI) và lỗi thiếu `remember` trong `@Composable`.
+4. **B4 - Context-Preserving Hybrid Refinement (`hybrid_resolver.py`)**: Chuẩn hóa 5 biến dạng Bytecode (`SuspendLambda.invokeSuspend`, `$default`, Kotlin Extension `arity+1`, `access$`, `lambda$`) và hợp nhất cạnh SvACE vào `call_edges` mà vẫn bảo toàn 100% `line_number`, `local_loop_depth` và chốt chặn `SWITCH_TO_BG` của AST.
+5. **B5 - Android Semantic Stitching (`stitcher.py`)**: Áp dụng 16 nhóm Heavy Sinks (nhân lũy thừa ngay tại điểm gọi Sink nếu Sink nằm trong vòng lặp nội bộ), gắn `is_ui_entry`, nối cạnh ảo DI (`@Binds/@Provides/@Inject/Koin`), nối `StateFlow/LiveData` và bắt tranh chấp khóa chéo luồng (`CROSS_THREAD_LOCK_CONTENTION`).
+6. **B6 - Tarjan SCC & Dual-Metric Bottom-Up DP (`summary_engine.py`)**: Khử chu trình đệ quy bằng Tarjan SCC (phạt đệ quy $\times 8.0$), tính song song $\text{MaxPathCost}(u)$ và $\text{DampedSubtreeCost}(u)$ (giảm chấn $0.35$), đồng thời lưu con trỏ chính xác `best_next_edge[u]`.
+7. **B7 - Exact Witness Tracing & Synergy Scoring (`summary_engine.py`)**: Lần theo con trỏ `best_next_edge` (tuyệt đối không đi qua cạnh `SWITCH_TO_BG`) để trích xuất Top-K Call Flows cụ thể và nhân hệ số cộng hưởng $\Psi_{\text{synergy}}(\pi) \times \Omega_{\text{build}}(\pi)$.
+8. **B8 - Spine Slicing, UI Anchor Extraction, DLP & Parallel Gemini CLI (`ai_verifier/`)**: Cắt lát xương sống nội hàm ($\le 250$ dòng, không bao giờ mất nút lá), trích xuất mỏ neo giao diện (`R.layout`, `R.id`, `R.string`, `if/when` guards), che giấu secret qua `DLPAirlock`, và gọi song song Gemini CLI để thẩm định 5 cổng CEGAR + sinh `refactoring_diff_suggestion` + `qa_test_case`.
+9. **B9 - Multi-Format Reporting (`reporters/`)**: Xuất báo cáo `.sarif` (với `codeFlows`), `.md` (Mermaid) và `.html` (Bảng Call Chain, Mermaid, Code Diff và Thẻ Test Case chi tiết cho QA).
+
+================================================================================
+## 2. MA TRẬN 16 NHÓM LỖI HIỆU NĂNG THEO 5 TIÊN ĐỀ VẬT LÝ TRÊN ANDROID
+================================================================================
+1. **Nhóm 1**: Thuật toán độ phức tạp bậc cao $O(N^2), O(N^3)$ liên hàm / nội hàm & Đệ quy trên Main Thread.
+2. **Nhóm 2**: Truy cập Đĩa, File I/O, `SharedPreferences.commit` & N+1 Database Query (`SQLite`/`Room`/`ContentResolver`).
+3. **Nhóm 3**: Nghẽn giao tiếp liên tiến trình đồng bộ (`Binder IPC` sang `system_server`: `PackageManager`, `ActivityManager`, `ConnectivityManager`, `ClipboardManager`...).
+4. **Nhóm 4**: Vi phạm ngân sách khung hình ($< 8.3\text{ms}$) trên Render Path (`onDraw`, `onBindViewHolder`) & Giải mã `BitmapFactory` / Cấp phát rác gây GC Pause (`MEMORY_GC_CHURN`).
+5. **Nhóm 5**: Bẫy bất đồng bộ Coroutine `suspend` quên chuyển luồng, đẩy ngược tác vụ nặng qua `View.post`/`runOnUiThread`, và Tranh chấp khóa `synchronized` / `by lazy` gây ANR (`CROSS_THREAD_LOCK_CONTENTION`).
+6. **Nhóm 6**: Chi phí CPU ngầm từ Serialization (`Gson`/`Moshi`/`JSONObject`), biên dịch `Regex` lặp lại và `Reflection`.
+7. **Nhóm 7**: Tác vụ nặng dây chuyền làm chậm khởi động ứng dụng (`COLD_START_DELAY` trong `Application/Activity.onCreate`).
+8. **Nhóm 8**: Bão vẽ lại trong Jetpack Compose (`@Composable` gọi hàm biến đổi tập hợp/tính toán nặng mà thiếu `remember {}` / `derivedStateOf {}`).
+9. **Nhóm 9**: Layout Thrashing (`requestLayout()` trong lúc cuộn/animation, đo kép `measureChild`) & Lạm dụng `Adapter.notifyDataSetChanged()`.
+10. **Nhóm 10**: Các API khởi tạo ngầm gây đóng băng của Framework & HAL (`new WebView`, `runBlocking`, `CameraManager.getCameraCharacteristics`, `MediaMetadataRetriever`, `ExifInterface`, `MediaCodec`).
+11. **Nhóm 11**: Nghẽn đóng gói dữ liệu lớn liên màn hình qua `Bundle` / `Parcel` / `Serializable` IPC.
+12. **Nhóm 12**: Tích tụ Listener (`registerReceiver`, `addOnGlobalLayoutListener`, `addOnScrollListener`...) hoặc mở tài nguyên không đóng bên trong `onBindViewHolder` / vòng lặp.
+13. **Nhóm 13**: Quét bảng tài nguyên động bằng chuỗi (`Resources.getIdentifier`) & Giải nén Font/Asset (`Typeface.createFromAsset`, `AssetManager.open`) đồng bộ.
+14. **Nhóm 14**: Gọi phần cứng bảo mật TEE qua `AndroidKeyStore` IPC, mã hóa `Cipher.doFinal`, băm `MessageDigest` và nén/giải nén `Zip/GZIP` trên luồng UI.
+15. **Nhóm 15**: Bão khởi tạo luồng thô (`new Thread()`, `Executors.new*`) trong vòng lặp & Cầu nối JNI (`external fun` / `native`) không gom lô.
+16. **Nhóm 16**: Tra cứu DNS đồng bộ ngầm (`InetAddress.getByName`, `URL.equals`, `URL.hashCode`), quét thư mục `okhttp3.Cache` và kết nối Socket cục bộ.
+
+================================================================================
+## 3. NỘI DUNG ĐẦY ĐỦ FILE `config/android_entrypoints.json`
+================================================================================
+Hãy lưu nội dung JSON dưới đây vào `config/android_entrypoints.json`:
+
+```json
+{
+  "_meta": {
+    "version": "2.0.0",
+    "description": "Android Main Thread & Sensitive Entry Points Catalog for ASPA V2"
+  },
+  "categories": {
+    "RENDER_AND_SCROLL_CRITICAL": {
+      "entry_weight": 5.0,
+      "is_render_path": true,
+      "frame_budget_ms": 8.33,
+      "methods": [
+        "onDraw",
+        "dispatchDraw",
+        "draw",
+        "onMeasure",
+        "onLayout",
+        "onBindViewHolder",
+        "onCreateViewHolder",
+        "onViewAttachedToWindow",
+        "onScrolled",
+        "onScrollStateChanged",
+        "getView",
+        "getDropDownView",
+        "getItemViewType",
+        "doFrame",
+        "onAnimationUpdate",
+        "onPreDraw",
+        "onGlobalLayout"
+      ],
+      "annotations": [
+        "Composable"
+      ]
+    },
+    "LIFECYCLE_AND_STARTUP_CRITICAL": {
+      "entry_weight": 2.5,
+      "is_render_path": false,
+      "frame_budget_ms": 16.67,
+      "methods": [
+        "attachBaseContext",
+        "onCreate",
+        "onStart",
+        "onResume",
+        "onPostCreate",
+        "onPostResume",
+        "onCreateView",
+        "onViewCreated",
+        "onActivityCreated",
+        "onViewStateRestored",
+        "onSaveInstanceState",
+        "onRestoreInstanceState",
+        "onConfigurationChanged",
+        "onNewIntent",
+        "onReceive",
+        "onStartCommand",
+        "onBind"
+      ]
+    },
+    "USER_INTERACTION_CRITICAL": {
+      "entry_weight": 2.0,
+      "is_render_path": false,
+      "frame_budget_ms": 16.67,
+      "methods": [
+        "onClick",
+        "onLongClick",
+        "onTouch",
+        "onTouchEvent",
+        "onInterceptTouchEvent",
+        "dispatchTouchEvent",
+        "onItemClick",
+        "onItemSelected",
+        "onCheckedChanged",
+        "onProgressChanged",
+        "beforeTextChanged",
+        "onTextChanged",
+        "afterTextChanged",
+        "onEditorAction",
+        "onKeyDown",
+        "onKeyUp",
+        "onBackPressed",
+        "onOptionsItemSelected",
+        "onNavigationItemSelected"
+      ]
+    },
+    "CONDITIONAL_HANDLER_CALLBACKS": {
+      "entry_weight": 2.0,
+      "is_render_path": false,
+      "requires_main_looper_check": true,
+      "description": "Camera2/Media/Sensor callbacks that only run on Main Thread if registered with null/MainLooper Handler",
+      "methods": [
+        "onOpened",
+        "onDisconnected",
+        "onError",
+        "onConfigured",
+        "onConfigureFailed",
+        "onCaptureCompleted",
+        "onCaptureProgressed",
+        "onCaptureFailed",
+        "onImageAvailable",
+        "onSensorChanged"
+      ]
+    },
+    "CONTENT_PROVIDER_AND_IPC_ENTRY": {
+      "entry_weight": 1.8,
+      "is_render_path": false,
+      "class_hints": ["Provider", "Stub", "Service", "Binder", "Resolver"],
+      "methods": [
+        "query",
+        "insert",
+        "update",
+        "delete",
+        "call",
+        "openFile",
+        "onTransact"
+      ]
+    }
+  }
+}
+```
+
+================================================================================
+## 4. NỘI DUNG ĐẦY ĐỦ FILE `config/android_sinks.json` (16 NHÓM)
+================================================================================
+Hãy lưu nội dung JSON dưới đây vào `config/android_sinks.json`:
+
+```json
+{
+  "_meta": {
+    "version": "2.0.0",
+    "description": "Complete 16-Group Android Heavy Sink Catalog for ASPA V2",
+    "matching_rules": {
+      "no_dot_pattern": "Exact match against callee_raw_name (without /arity)",
+      "dotted_pattern": "Suffix/substring match against resolved callee_fqn"
+    }
+  },
+  "categories": {
+    "THREAD_BLOCKING_ANR": {
+      "sink_cost": 150.0,
+      "requires_loop": false,
+      "impacted_ux_metric": "ANR_RISK",
+      "patterns": [
+        "Thread.sleep", "Object.wait", "Condition.await", "CountDownLatch.await",
+        "CyclicBarrier.await", "Semaphore.acquire", "Future.get", "CompletableFuture.get",
+        "CompletableFuture.join", "BuildersKt.runBlocking", "runBlocking",
+        "BlockingKt.runBlocking", "Process.waitFor", "Lock.lock", "ReentrantLock.lock"
+      ]
+    },
+    "DISK_AND_DB_IO": {
+      "sink_cost": 120.0,
+      "requires_loop": false,
+      "impacted_ux_metric": "ANR_RISK",
+      "patterns": [
+        "Context.getSharedPreferences", "getSharedPreferences",
+        "SharedPreferences.Editor.commit", "Editor.commit",
+        "SQLiteDatabase.rawQuery", "SQLiteDatabase.query", "SQLiteDatabase.insert",
+        "SQLiteDatabase.update", "SQLiteDatabase.delete", "SQLiteDatabase.execSQL",
+        "SupportSQLiteDatabase.query", "SupportSQLiteDatabase.execSQL",
+        "ContentResolver.query", "ContentResolver.insert", "ContentResolver.update",
+        "ContentResolver.delete", "ContentResolver.openInputStream", "ContentResolver.openOutputStream",
+        "File.readText", "File.readBytes", "File.readLines", "File.writeText", "File.writeBytes",
+        "File.exists", "File.length", "File.listFiles", "File.mkdirs", "File.delete",
+        "FilesKt.readText", "FilesKt.readBytes", "FilesKt.writeText",
+        "FileInputStream.<init>", "FileOutputStream.<init>", "RandomAccessFile.<init>",
+        "FileChannel.force", "FileDescriptor.sync"
+      ]
+    },
+    "LIFECYCLE_LISTENER_ACCUMULATION": {
+      "sink_cost": 110.0,
+      "requires_loop": true,
+      "impacted_ux_metric": "MEMORY_GC_CHURN",
+      "patterns": [
+        "Context.registerReceiver", "registerReceiver",
+        "ViewTreeObserver.addOnGlobalLayoutListener", "addOnGlobalLayoutListener",
+        "ViewTreeObserver.addOnPreDrawListener", "addOnPreDrawListener",
+        "RecyclerView.addOnScrollListener", "addOnScrollListener",
+        "Lifecycle.addObserver", "ContentResolver.registerContentObserver", "registerContentObserver",
+        "SharedPreferences.registerOnSharedPreferenceChangeListener", "registerOnSharedPreferenceChangeListener",
+        "SensorManager.registerListener", "Context.obtainStyledAttributes", "obtainStyledAttributes"
+      ]
+    },
+    "HEAVY_GRAPHICS_AND_DOCUMENT_IO": {
+      "sink_cost": 100.0,
+      "requires_loop": false,
+      "impacted_ux_metric": "FRAME_JANK",
+      "patterns": [
+        "BitmapFactory.decodeFile", "BitmapFactory.decodeResource", "BitmapFactory.decodeStream",
+        "BitmapFactory.decodeByteArray", "BitmapFactory.decodeFileDescriptor",
+        "ImageDecoder.decodeBitmap", "ImageDecoder.decodeDrawable",
+        "Bitmap.createBitmap", "Bitmap.compress", "Bitmap.copy",
+        "BitmapRegionDecoder.decodeRegion", "PdfRenderer.<init>", "PdfRenderer.Page.render",
+        "Canvas.saveLayer"
+      ]
+    },
+    "FRAMEWORK_AND_HAL_COLD_STALLS": {
+      "sink_cost": 95.0,
+      "requires_loop": false,
+      "impacted_ux_metric": "COLD_START_DELAY",
+      "patterns": [
+        "WebView.<init>", "WebSettings.getDefaultUserAgent", "CookieManager.getInstance",
+        "CameraManager.getCameraCharacteristics", "getCameraCharacteristics",
+        "CameraManager.getCameraIdList", "CameraManager.openCamera", "Camera.open",
+        "MediaMetadataRetriever.setDataSource", "MediaMetadataRetriever.extractMetadata",
+        "MediaMetadataRetriever.getFrameAtTime", "ExifInterface.<init>", "ExifInterface.saveAttributes",
+        "MediaCodec.createDecoderByType", "MediaCodec.createEncoderByType",
+        "MediaCodec.createByCodecName", "MediaCodec.configure", "RingtoneManager.getRingtone"
+      ]
+    },
+    "DATABASE_QUERY_IN_LOOP": {
+      "sink_cost": 90.0,
+      "requires_loop": true,
+      "impacted_ux_metric": "FRAME_JANK",
+      "patterns": [
+        "rawQuery", "query", "execSQL", "findById", "loadById", "getById"
+      ]
+    },
+    "CRYPTO_KEYSTORE_AND_COMPRESSION": {
+      "sink_cost": 85.0,
+      "requires_loop": false,
+      "impacted_ux_metric": "ANR_RISK",
+      "patterns": [
+        "KeyStore.getInstance", "KeyStore.load", "KeyStore.getEntry", "KeyStore.getKey",
+        "KeyStore.setEntry", "KeyGenerator.generateKey", "KeyPairGenerator.generateKeyPair",
+        "SecretKeyFactory.generateSecret", "Cipher.getInstance", "Cipher.init", "Cipher.doFinal",
+        "MessageDigest.digest", "Mac.doFinal", "Signature.sign", "Signature.verify",
+        "ZipInputStream.getNextEntry", "ZipFile.<init>", "GZIPInputStream.<init>", "GZIPOutputStream.<init>"
+      ]
+    },
+    "BINDER_IPC": {
+      "sink_cost": 80.0,
+      "requires_loop": false,
+      "impacted_ux_metric": "FRAME_JANK",
+      "patterns": [
+        "PackageManager.getInstalledPackages", "getInstalledPackages",
+        "PackageManager.getInstalledApplications", "getInstalledApplications",
+        "PackageManager.getApplicationInfo", "getApplicationInfo",
+        "PackageManager.getPackageInfo", "getPackageInfo",
+        "PackageManager.queryIntentActivities", "queryIntentActivities",
+        "PackageManager.queryIntentServices", "queryIntentServices",
+        "PackageManager.resolveActivity", "resolveActivity",
+        "PackageManager.getApplicationLabel", "ActivityManager.getRunningAppProcesses",
+        "getRunningAppProcesses", "ActivityManager.getMemoryInfo", "ActivityManager.getRunningServices",
+        "ConnectivityManager.getActiveNetworkInfo", "getActiveNetworkInfo",
+        "ConnectivityManager.getNetworkCapabilities", "getNetworkCapabilities",
+        "ConnectivityManager.getAllNetworks", "ClipboardManager.getPrimaryClip", "getPrimaryClip",
+        "ClipboardManager.hasPrimaryClip", "TelephonyManager.getDeviceId",
+        "WifiManager.getConnectionInfo", "WifiManager.getScanResults",
+        "AudioManager.getDevices", "Context.getSystemService"
+      ]
+    },
+    "MAIN_THREAD_LAYOUT_INFLATION": {
+      "sink_cost": 75.0,
+      "requires_loop": true,
+      "impacted_ux_metric": "FRAME_JANK",
+      "patterns": [
+        "LayoutInflater.inflate", "View.inflate", "inflate",
+        "ViewGroup.addView", "addView", "ViewGroup.removeAllViews", "Activity.setContentView"
+      ]
+    },
+    "HIDDEN_DNS_AND_SOCKET_BLOCKING": {
+      "sink_cost": 75.0,
+      "requires_loop": false,
+      "impacted_ux_metric": "ANR_RISK",
+      "patterns": [
+        "InetAddress.getByName", "InetAddress.getAllByName", "URL.equals", "URL.hashCode",
+        "URL.openConnection", "URL.openStream", "okhttp3.Cache.<init>",
+        "LocalSocket.connect", "Socket.connect"
+      ]
+    },
+    "IPC_BUNDLE_AND_PARCEL_BLOAT": {
+      "sink_cost": 70.0,
+      "requires_loop": false,
+      "impacted_ux_metric": "FRAME_JANK",
+      "patterns": [
+        "Bundle.putSerializable", "putSerializable", "Intent.putExtra",
+        "Intent.getSerializableExtra", "getSerializableExtra", "Bundle.getSerializable",
+        "Bundle.putParcelableArrayList", "putParcelableArrayList",
+        "Intent.putParcelableArrayListExtra", "Parcel.writeValue", "Parcel.marshall",
+        "ObjectOutputStream.writeObject", "ObjectInputStream.readObject"
+      ]
+    },
+    "UI_LAYOUT_THRASHING_AND_REBIND": {
+      "sink_cost": 65.0,
+      "requires_loop": false,
+      "impacted_ux_metric": "FRAME_JANK",
+      "patterns": [
+        "RecyclerView.Adapter.notifyDataSetChanged", "Adapter.notifyDataSetChanged",
+        "notifyDataSetChanged", "BaseAdapter.notifyDataSetChanged",
+        "View.requestLayout", "View.forceLayout", "ViewGroup.measureChild",
+        "ViewGroup.measureChildren", "ViewGroup.measureChildWithMargins"
+      ]
+    },
+    "RESOURCE_AND_ASSET_THRASHING": {
+      "sink_cost": 60.0,
+      "requires_loop": false,
+      "impacted_ux_metric": "FRAME_JANK",
+      "patterns": [
+        "Resources.getIdentifier", "getIdentifier", "AssetManager.open", "AssetManager.openFd",
+        "AssetManager.list", "Typeface.createFromAsset", "createFromAsset",
+        "Typeface.createFromFile", "createFromFile", "ResourcesCompat.getFont",
+        "Resources.getDrawable", "AppCompatResources.getDrawable"
+      ]
+    },
+    "JNI_AND_THREAD_CREATION_OVERHEAD": {
+      "sink_cost": 60.0,
+      "requires_loop": true,
+      "impacted_ux_metric": "FRAME_JANK",
+      "patterns": [
+        "Thread.<init>", "Thread.start", "Executors.newCachedThreadPool",
+        "Executors.newFixedThreadPool", "Executors.newSingleThreadExecutor",
+        "HandlerThread.<init>", "System.loadLibrary", "Runtime.exec", "ProcessBuilder.start"
+      ]
+    },
+    "CPU_SERIALIZATION_AND_REGEX": {
+      "sink_cost": 45.0,
+      "requires_loop": false,
+      "impacted_ux_metric": "FRAME_JANK",
+      "patterns": [
+        "Gson.fromJson", "Gson.toJson", "fromJson", "toJson", "Moshi.adapter",
+        "JsonAdapter.fromJson", "JsonAdapter.toJson", "ObjectMapper.readValue",
+        "ObjectMapper.writeValueAsString", "JSONObject.<init>", "JSONArray.<init>",
+        "XmlPullParser.next", "Pattern.compile", "Regex.<init>", "String.matches",
+        "String.replaceAll", "String.split", "Class.forName", "Class.getDeclaredMethod",
+        "Class.getDeclaredField", "Method.invoke", "Constructor.newInstance",
+        "DateFormat.parse", "SimpleDateFormat.<init>"
+      ]
+    },
+    "COMPOSE_RECOMPOSITION_AND_SUBOPTIMAL_LOOP": {
+      "sink_cost": 25.0,
+      "requires_loop": true,
+      "impacted_ux_metric": "MEMORY_GC_CHURN",
+      "patterns": [
+        "List.contains", "ArrayList.contains", "Set.contains", "contains",
+        "List.indexOf", "ArrayList.indexOf", "indexOf", "List.lastIndexOf", "lastIndexOf",
+        "List.remove", "ArrayList.remove", "CollectionsKt.sortedBy",
+        "CollectionsKt.sortedWith", "CollectionsKt.distinctBy", "String.format", "StringBuilder.append"
+      ]
+    }
+  }
+}
+```

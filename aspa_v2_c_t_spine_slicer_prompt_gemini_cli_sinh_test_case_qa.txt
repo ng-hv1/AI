@@ -1,0 +1,216 @@
+# TÀI LIỆU 04: ĐẶC TẢ SPINE SLICER, GEMINI CLI 5-GATE PROMPT & BỘ SINH TEST CASE CHO TESTER (QA)
+(Dùng để đưa cho AI nâng cấp các file: `ai_verifier/slicer.py`, `ai_verifier/prompt_templates.py`, `ai_verifier/gemini_cli.py`, `reporters/html_reporter.py`)
+
+Hãy đóng vai Principal AI-for-SE & Android Performance Architect. Hãy nâng cấp tầng `ai_verifier/` và `reporters/html_reporter.py` theo đúng đặc tả dưới đây để:
+1. Không bao giờ bị cắt cụt nút lá ở giới hạn 250 dòng khi cắt lát mã nguồn (`Spine Slicing`).
+2. Tự động trích xuất các mỏ neo giao diện (`R.layout`, `R.id`, `R.string`, `if/when` guards) dọc theo Call Flow.
+3. Giúp Gemini CLI thẩm định chính xác qua 5 cổng CEGAR, tự động cắt tỉa đồ thị động qua `decisive_node_fqn`, và sinh ra **Thẻ Kịch bản Kiểm thử (QA Test Case Card)** chi tiết cho Tester không biết code.
+
+================================================================================
+## 1. NÂNG CẤP `ai_verifier/slicer.py`: SPINE SLICING & UI ANCHOR EXTRACTOR
+================================================================================
+
+### 1.1. Cắt lát Xương sống Nội hàm (Intra-procedural Spine Slicing)
+**Vấn đề cần giải quyết**: Nếu `Hop 0` hoặc `Hop 1` là một hàm dài 180 dòng và class có 40 fields, cách cắt cũ sẽ lấy trọn 180 dòng đó và làm tràn ngân sách `max_lines = 250`, khiến `Hop 3` và `Hop 4` (nơi chứa Sink thật sự!) bị cắt mất.
+
+**Thuật toán mới trong `WitnessSlicer.slice_hotpath(hp: HotPath, max_lines: int = 260)`**:
+1. **Chia ngân sách dòng đảm bảo mọi Hop đều có mặt**:
+   - Với chuỗi `call_chain` có $K$ hàm ($K = \text{len}(\text{hp.call\_chain})$), ngân sách dòng tối đa cho mỗi Hop là `hop_line_budget = max(32, max_lines // max(1, K))`.
+2. **Lọc Fields thông minh (`_extract_referenced_fields_only`)**:
+   - Thay vì lấy toàn bộ fields của class, chỉ trích xuất những dòng khai báo field/property của class nếu **tên biến của field đó xuất hiện trong thân hàm đích** (tối đa 8 dòng fields quan trọng nhất).
+3. **Nén Thân hàm Dài quanh Dòng Gọi (`_compress_method_body_around_call`)**:
+   - Nếu thân hàm tại `Hop i` ngắn hơn hoặc bằng `hop_line_budget`: giữ nguyên toàn bộ thân hàm (kèm đánh số dòng `/* L123 */`).
+   - Nếu thân hàm dài hơn `hop_line_budget`, biết rằng `Hop i` gọi sang `Hop i+1` (hoặc gọi Sink) tại dòng `target_line`:
+     - Giữ lại dòng chữ ký hàm + **8 dòng đầu tiên của thân hàm** (để bảo toàn các câu lệnh chặn sớm `if (isCached) return` ở đầu hàm).
+     - Dùng Tree-sitter tìm trên đường đi tổ tiên từ dòng `target_line` lên đầu hàm tất cả các dòng tiêu đề của câu lệnh `if (...)`, `when (...)`, `for (...)`, `while (...)`, `.forEach {`, `withContext(...)`, `synchronized(...)` bao quanh `target_line` và giữ lại các dòng tiêu đề đó.
+     - Giữ lại cửa sổ **$\pm 6$ dòng** xung quanh `target_line`.
+     - Thay thế các khối lệnh rẽ nhánh không liên quan bằng chú thích: `/* ... [ASPA SpineSlicer: omitted N unrelated lines] ... */`.
+
+### 1.2. Trích xuất Mỏ neo Giao diện & Điều kiện Đường đi (`extract_ui_and_path_anchors`)
+Viết phương thức `WitnessSlicer.extract_ui_and_path_anchors(hp: HotPath) -> Dict[str, Any]` quét qua file của `Hop 0`, `Hop 1` và các hàm trên đường đi để thu thập:
+- `screen_and_class_names`: Tên class của `Hop 0` và `Hop 1` (VD: `CameraPreviewFragment`, `FilterAdapter`).
+- `layout_resources`: Tất cả chuỗi khớp Regex `R\.layout\.[a-zA-Z0-9_]+` hoặc tên class `*Binding` (VD: `FragmentCameraPreviewBinding`, `R.layout.item_filter_badge`).
+- `view_id_resources`: Tất cả chuỗi khớp `R\.id\.[a-zA-Z0-9_]+` hoặc `binding\.[a-zA-Z0-9_]+` nằm trong các hàm của Call Flow.
+- `string_resources`: Tất cả chuỗi khớp `R\.string\.[a-zA-Z0-9_]+` trong các hàm của Call Flow.
+- `path_guard_conditions`: Danh sách các câu lệnh điều kiện `if (...)` / `when (...)` bao quanh các điểm gọi hàm dọc từ `Hop 0` đến `Hop k` (để AI dịch thành điều kiện cài đặt `Pre-conditions` cho Tester).
+
+### 1.3. Tạo Bảng Giải phẫu Từng bước nhảy (`build_hop_topology_table`)
+Sinh chuỗi văn bản mô tả rõ từng bước nhảy từ `hp.hop_edges_metadata`:
+```text
+[Hop 0 -> 1] com.app.FilterAdapter.onBindViewHolder/2 (line 54)
+   ===[loop_depth=1 (PARAM_DEPENDENT, x12.0) | thread=UI_MAIN | source=AST_DIRECT | BUILT]===>
+   com.app.BadgeHelper.bindBadges/2 (Hệ số nhân tích lũy: x12.0)
+[Hop 1 -> 2] com.app.BadgeHelper.bindBadges/2 (line 29)
+   ===[loop_depth=1 (PARAM_DEPENDENT, x12.0) | thread=AGNOSTIC | source=SVACE_BYTECODE_BRIDGE | BUILT]===>
+   com.app.CategoryRepoImpl.findCategory/1 (Hệ số nhân tích lũy: x144.0 -> O(N^2))
+```
+
+================================================================================
+## 2. SCHEMA PYDANTIC MỚI TRONG `ai_verifier/gemini_cli.py`
+================================================================================
+Cập nhật model dữ liệu xác thực JSON trả về từ Gemini CLI:
+
+```python
+from typing import List, Literal, Optional
+from pydantic import BaseModel, Field
+
+class HopAuditItem(BaseModel):
+    hop_index: int
+    fqn: str
+    finding: str
+
+class QATestCaseSpec(BaseModel):
+    test_case_id: str = Field(default="PERF-TC-001")
+    test_title: str = Field(default="")
+    target_screen_and_ui: str = Field(default="")
+    preconditions_and_settings: List[str] = Field(default_factory=list)
+    stress_data_setup: List[str] = Field(default_factory=list)
+    reproduction_steps: List[str] = Field(default_factory=list)
+    expected_bug_symptom: str = Field(default="")
+    pass_fail_criteria: str = Field(default="")
+    profiler_verification_hint: str = Field(default="")
+
+class VerificationResult(BaseModel):
+    verdict: Literal["CONFIRMED_BOTTLENECK", "FALSE_POSITIVE", "NEEDS_RUNTIME_TRACE"]
+    adjusted_severity: Literal["CRITICAL", "HIGH", "MEDIUM", "LOW", "NONE"]
+    impacted_ux_metric: Literal["FRAME_JANK", "ANR_RISK", "COLD_START_DELAY", "MEMORY_GC_CHURN", "NONE"]
+    effective_time_complexity: str
+    estimated_wall_time_ms: str = Field(default="unknown")
+    decisive_node_fqn: Optional[str] = Field(default=None)
+    hop_by_hop_audit: List[HopAuditItem] = Field(default_factory=list)
+    refutation_or_confirmation_reasoning: str
+    loop_bound_override: Optional[Literal["NONE", "CONST_SMALL", "UI_BOUNDED", "PARAM_DEPENDENT", "UNBOUNDED_IO"]] = None
+    thread_contract_override: Optional[Literal["UI_MAIN", "WORKER_BG", "SWITCH_TO_BG", "AGNOSTIC"]] = None
+    refactoring_diff_suggestion: str = Field(default="")
+    qa_test_case: Optional[QATestCaseSpec] = Field(default=None)
+```
+
+### Cơ chế Cắt tỉa Động theo `decisive_node_fqn` & Chạy Song song:
+1. Trong Bước B8 (`cli.py` / `gemini_cli.py`), nếu một Hot Path được Gemini CLI trả về `verdict == "FALSE_POSITIVE"` kèm theo `decisive_node_fqn` (ví dụ một hàm tiện ích `Config.getFlag/1` thực chất đã có biến cache `O(1)` trong RAM hoặc đã tự chạy ngầm), hãy đưa `decisive_node_fqn` vào tập `verified_safe_sinks`. Các Hot Path xếp sau nếu chỉ bị điểm cao do chạm vào cùng nút lá `decisive_node_fqn` đó sẽ tự động kế thừa kết quả bác bỏ mà không tốn thêm lượt gọi Gemini CLI.
+2. Cho phép chạy song song bước thẩm định qua `ThreadPoolExecutor(max_workers=3)` để tăng tốc gấp 3 lần.
+
+================================================================================
+## 3. NỘI DUNG ĐẦY ĐỦ FILE `ai_verifier/prompt_templates.py`
+================================================================================
+Hãy tạo file `ai_verifier/prompt_templates.py` với nội dung hoàn chỉnh sau:
+
+```python
+CALLFLOW_VERIFIER_SYSTEM_PROMPT = (
+    "Bạn là Principal Android Performance Architect, Chuyên gia Kiểm chứng Chương trình (CEGAR Verifier) "
+    "và QA Performance Test Lead. Nhiệm vụ của bạn là thẩm định một CHUỖI GỌI HÀM (Call Flow) nghi ngờ gây nghẽn "
+    "Main Thread trên Android được trích xuất từ hệ thống phân tích tĩnh lai (Tree-sitter AST + SvACE Bytecode Graph). "
+    "Hãy phản biện nghiêm ngặt qua 5 cổng kiểm chứng để loại bỏ False Positives; nếu xác nhận là điểm nghẽn thật sự "
+    "(CONFIRMED_BOTTLENECK) hoặc cần đo thực tế (NEEDS_RUNTIME_TRACE), hãy sinh bản vá code đa tầng (Refactoring Diff) "
+    "và chuyển đổi ngôn ngữ lập trình sang Kịch bản Test Case chi tiết cho Tester (không biết code) trong trường qa_test_case. "
+    "BẮT BUỘC chỉ xuất ra duy nhất 1 khối raw JSON hợp lệ theo đúng schema, tuyệt đối KHÔNG bọc trong ```json markdown."
+)
+
+CALLFLOW_VERIFIER_STDIN_TEMPLATE = """# PHẦN 1: HỒ SƠ ĐỊNH LƯỢNG CALL FLOW TỪ ASPA V2
+- Điểm khởi phát (Root Entry): `{root_fqn}` (Trọng số Entry: `{entry_weight}`)
+- Điểm rủi ro tổng hợp (UX Risk Score): `{ux_risk_score:.2f}`
+  * MaxPathCost: `{max_path_cost:.2f}` | DampedSubtreeCost: `{subtree_cost:.2f}`
+  * Hệ số cộng hưởng kích hoạt (Synergy Flags): `{active_synergy_flags}`
+  * Trạng thái Build Scope (SvACE): `{build_scope_status}` (Các node NOT_IN_BUILD: `{not_in_build_nodes}`)
+- Tổng độ sâu vòng lặp liên hàm tích lũy (Max Accumulated Loop Depth): `{max_accumulated_loop_depth}`
+- Danh sách Heavy Sinks chạm tới: `{detected_sinks_json}`
+- Cảnh báo tranh chấp khóa chéo luồng (Cross-Thread Lock Contention): `{lock_contention_details}`
+
+# PHẦN 2: MỎ NEO GIAO DIỆN & ĐIỀU KIỆN ĐƯỜNG ĐI (UI & PATH CONDITION ANCHORS)
+- Class / Màn hình liên quan: `{ui_screen_classes}`
+- Layout / ViewBinding phát hiện: `{ui_layouts}`
+- View IDs / Thành phần tương tác: `{ui_view_ids}`
+- Chuỗi văn bản (String Resources): `{ui_strings}`
+- Các điều kiện rẽ nhánh (`if/when` guards) dọc theo Call Flow:
+{path_guard_conditions}
+
+# PHẦN 3: BẢN ĐỒ ĐƯỜNG ĐI TỪNG BƯỚC (HOP-BY-HOP CALL CHAIN TOPOLOGY)
+{hop_by_hop_topology_table}
+
+# PHẦN 4: LÁT CẮT MÃ NGUỒN XƯƠNG SỐNG ĐÃ LÀM SẠCH DLP (SANITIZED SPINE SLICE)
+{sanitized_code_slice}
+
+# PHẦN 5: GIAO THỨC THẨM ĐỊNH 5 CỔNG & SUY LUẬN TEST CASE CHO QA
+Hãy thẩm định chuỗi Call Flow trên qua 5 cổng bắt buộc:
+
+1. **CỔNG 1 (Path Feasibility & Cache/Memoization Check)**:
+   - Kiểm tra xem dọc từ `[Hop 0]` xuống nút lá có cơ chế Early-Return Guard (`if (isInitialized) return`, `if (cache != null) return cache`, `LruCache`, `ConcurrentHashMap`) nào giúp phần tính toán nặng/Sink chỉ chạy đúng 1 lần rồi trả về O(1) ở các lần sau không?
+   - Các điều kiện `if/when` giữa hàm cha và hàm con có mâu thuẫn nhau (nhánh chết) không?
+
+2. **CỔNG 2 (Real-world Cardinality & Loop Amplification)**:
+   - Xác định biến tập hợp được lặp tại các Hop có `loop_depth >= 1`. Trong thực tế sử dụng của người dùng, số lượng phần tử `N` có thể tăng lên >= 20..500 phần tử không, hay bị giới hạn cứng bởi hằng số nghiệp vụ rất nhỏ (VD: mảng cố định <= 4 phần tử)?
+   - Nếu `[Hop 0]` là hàm chạy lặp theo khung hình (`onDraw`, `onMeasure`, `onBindViewHolder`, `@Composable`, `onScrolled`), hãy tính đến việc toàn bộ chuỗi này bị gọi lặp lại 60-120 lần mỗi giây khi người dùng vuốt màn hình.
+
+3. **CỔNG 3 (Hidden Threading & Callback Looper Check)**:
+   - Kiểm tra xem có cơ chế chuyển luồng sang Background nào mà AST chưa cắt nhánh không (VD: custom `Executor`, `Handler(bgThread.looper)`, RxJava `subscribeOn(Schedulers.io())`, hoặc `@IoDispatcher` inject qua constructor).
+   - Lưu ý: Hàm `suspend` hoặc `viewModelScope.launch` / `lifecycleScope.launch` không có `withContext(Dispatchers.IO / Default)` VẪN chạy trên Main Thread!
+   - Nếu Root là callback của Camera2 / ImageReader / MediaCodec / Sensor: kiểm tra xem lúc đăng ký có truyền `backgroundHandler` vào không. Nếu chạy hoàn toàn trên `backgroundHandler` và không tranh chấp khóa với UI -> đánh dấu `FALSE_POSITIVE`.
+
+4. **CỔNG 4 (Wall-Clock Estimation & Decisive Node Identification)**:
+   - Ước lượng tổng thời gian thực thi (`estimated_wall_time_ms`) trên thiết bị tầm trung và đối chiếu với ngân sách khung hình 8.3ms (120Hz) / 16.6ms (60Hz).
+   - Xác định `decisive_node_fqn`: FQN chính xác của hàm giữ vai trò quyết định nhất dẫn đến phán quyết (nút gây nghẽn chính hoặc nút chứa Cache giúp bác bỏ cảnh báo).
+
+5. **CỔNG 5 (Cross-Layer Refactoring Diff & 4-Dimensional Code-to-QA Test Case Translation)**:
+   - Nếu `verdict` là `CONFIRMED_BOTTLENECK` hoặc `NEEDS_RUNTIME_TRACE`:
+     a) Viết bản vá code `refactoring_diff_suggestion` giải quyết tận gốc (VD: Hoisting bước chuyển `List` sang `HashMap` O(1) lên ViewModel/UseCase, bọc `remember {}` cho `@Composable`, dùng `asSequence()`, hoặc chuyển xuống `withContext(Dispatchers.Default/IO)`).
+     b) Dịch ngược từ Code sang ngôn ngữ của Tester (không biết lập trình) trong object `qa_test_case`:
+        - **Chiều 1 (`target_screen_and_ui`)**: Dựa vào `{ui_screen_classes}`, `{ui_layouts}`, `{ui_view_ids}` để chỉ rõ tên màn hình, tab, nút bấm hoặc danh sách trên giao diện (Tuyệt đối KHÔNG viết kiểu lập trình như "Hãy gọi hàm onBindViewHolder").
+        - **Chiều 2 (`preconditions_and_settings`)**: Dịch các điều kiện `if/when` trong `{path_guard_conditions}` thành các cài đặt/trạng thái ứng dụng mà Tester phải bật trước khi test để luồng chạy đi vào đúng nhánh code này.
+        - **Chiều 3 (`stress_data_setup`)**: Dựa vào biến lặp tại các Hop có `loop_depth >= 1`, chỉ định số lượng dữ liệu mồi cụ thể mà Tester cần chuẩn bị (VD: "Tạo tối thiểu 50 ảnh / 30 bộ lọc / 100 bản ghi lịch sử").
+        - **Chiều 4 (`reproduction_steps`, `expected_bug_symptom`, `pass_fail_criteria`)**:
+          * Nếu là lỗi Render/Scroll (`FRAME_JANK`): Hướng dẫn Tester bật *"Profile HWUI rendering -> On screen as bars"* trong Developer Options và vuốt nhanh (fast fling) liên tục 5-10 lần.
+          * Nếu là lỗi Tranh chấp khóa (`CROSS_THREAD_LOCK_CONTENTION` / `ANR_RISK`): Hướng dẫn Tester thực hiện **2 thao tác đồng thời** (Bước 1: Kích hoạt tác vụ ngầm giữ khóa như chụp liên tục/lưu file/đồng bộ; Bước 2: Ngay lúc đó bấm/vuốt liên tục trên màn hình UI để ép 2 luồng đụng độ gây đơ/ANR).
+          * Nếu là lỗi Tích tụ Listener / Rác bộ nhớ (`MEMORY_GC_CHURN`): Hướng dẫn Tester lặp lại chu kỳ vào/ra màn hình hoặc cuộn danh sách liên tục trong 2-3 phút để kiểm tra độ trễ tăng dần theo thời gian.
+
+# PHẦN 6: ĐỊNH DẠNG ĐẦU RA BẮT BUỘC (STRICT RAW JSON SCHEMA)
+Chỉ trả về duy nhất 1 JSON object có cấu trúc như sau:
+{{
+  "verdict": "CONFIRMED_BOTTLENECK | FALSE_POSITIVE | NEEDS_RUNTIME_TRACE",
+  "adjusted_severity": "CRITICAL | HIGH | MEDIUM | LOW | NONE",
+  "impacted_ux_metric": "FRAME_JANK | ANR_RISK | COLD_START_DELAY | MEMORY_GC_CHURN | NONE",
+  "effective_time_complexity": "VD: O(N * M) per bound ViewHolder hoặc O(1) cached",
+  "estimated_wall_time_ms": "VD: '25ms - 60ms per frame' hoặc '< 0.1ms'",
+  "decisive_node_fqn": "pkg.Class.method/arity",
+  "hop_by_hop_audit": [
+    {{
+      "hop_index": 0,
+      "fqn": "pkg.Class.method/arity",
+      "finding": "Nhận xét ngắn gọn vai trò, vòng lặp, hoặc sink tại bước này"
+    }}
+  ],
+  "refutation_or_confirmation_reasoning": "Lập luận sắc bén qua 5 cổng kiểm chứng, dẫn chứng tên biến và số dòng",
+  "loop_bound_override": "NONE | CONST_SMALL | UI_BOUNDED | PARAM_DEPENDENT | UNBOUNDED_IO",
+  "thread_contract_override": "UI_MAIN | WORKER_BG | SWITCH_TO_BG | AGNOSTIC",
+  "refactoring_diff_suggestion": "Đoạn code diff hoặc code Kotlin/Java tối ưu hóa đa tầng (rỗng nếu FALSE_POSITIVE)",
+  "qa_test_case": {{
+    "test_case_id": "PERF-TC-001",
+    "test_title": "Tiêu đề ngắn gọn dễ hiểu cho Tester",
+    "target_screen_and_ui": "Tên màn hình và vị trí danh sách/nút bấm cụ thể trên giao diện",
+    "preconditions_and_settings": [
+      "Điều kiện cài đặt 1 cần bật (suy từ câu lệnh if/when trong code)",
+      "Điều kiện 2: Bật Profile HWUI rendering trong Developer Options"
+    ],
+    "stress_data_setup": [
+      "Chuẩn bị dữ liệu mồi số lượng lớn cụ thể (VD: >= 50 mục) để kích hoạt vòng lặp"
+    ],
+    "reproduction_steps": [
+      "Bước 1: ...",
+      "Bước 2: ...",
+      "Bước 3: ..."
+    ],
+    "expected_bug_symptom": "Biểu hiện giật/khựng/đơ cụ thể mà Tester quan sát được bằng mắt thường",
+    "pass_fail_criteria": "Tiêu chí Đạt/Không đạt rõ ràng (cột HWUI dưới vạch đỏ 16.6ms/8.3ms, không xuất hiện ANR)",
+    "profiler_verification_hint": "Dấu hiệu hàm cần tìm trên Perfetto Trace hoặc Logcat"
+  }}
+}}
+"""
+```
+
+================================================================================
+## 4. NÂNG CẤP `reporters/html_reporter.py`: HIỂN THỊ THẺ QA TEST CASE TRỰC QUAN
+================================================================================
+Trong `HTMLReporter`, trên mỗi Card của một `HotPath`, hãy hiển thị khu vực **"QA Verification & Reproduction Test Case"** đọc trực tiếp từ `verification_result.qa_test_case` (nếu có, và fallback về hàm sinh mặc định nếu chạy ở chế độ không bật `--verify-with-gemini`):
+- Hiển thị Badge mã kịch bản `test_case_id`, `test_title` và vị trí màn hình `target_screen_and_ui`.
+- Chia làm 3 cột rõ ràng cho Tester:
+  1. **Điều kiện Tiên quyết & Cài đặt (`preconditions_and_settings`)** + **Dữ liệu Mồi (`stress_data_setup`)**.
+  2. **Các bước Thao tác Tái hiện (`reproduction_steps`)**.
+  3. **Triệu chứng Lỗi (`expected_bug_symptom`)**, **Tiêu chí Nghiệm thu (`pass_fail_criteria`)** và **Gợi ý Soi Perfetto (`profiler_verification_hint`)**.
