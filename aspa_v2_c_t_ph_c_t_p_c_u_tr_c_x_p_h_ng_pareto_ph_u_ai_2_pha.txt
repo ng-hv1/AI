@@ -1,0 +1,198 @@
+# TÀI LIỆU 06: ĐẶC TẢ KIẾN TRÚC ZERO-HYPERPARAMETER — ĐO ĐỘ PHỨC TẠP CẤU TRÚC CALL FLOW, XẾP HẠNG ĐƯỜNG BIÊN PARETO & PHỄU AI 2 PHA
+(Dùng để đưa cho AI triển khai/nâng cấp các file: `core/models.py`, `core/parser.py`, `core/pareto_ranker.py`, `core/summary_engine.py`, `ai_verifier/batch_triage.py`, và `ai_verifier/gemini_cli.py`)
+
+Hãy đóng vai Principal Program Analysis & AI-for-SE Architect. Mục tiêu của bản nâng cấp này là **loại bỏ hoàn toàn sự phụ thuộc vào các hệ số trọng số cảm tính (magic weights)** vốn phải tinh chỉnh lại mỗi khi đổi sang dự án mới, đồng thời giải quyết triệt để vấn đề **Actual Issues bị văng khỏi Top 10 (nằm rải rác ở Top 10 - 150)** mà không làm tốn token khi gọi Gemini CLI.
+
+Hãy triển khai đầy đủ 4 phân hệ dưới đây vào `android_perf_analyzer` và viết bộ kiểm thử trong `tests/test_pareto_and_batch_funnel.py`.
+
+================================================================================
+## 1. TỔNG QUAN KIẾN TRÚC MỚI (ZERO-HYPERPARAMETER PIPELINE)
+================================================================================
+Thay vì dùng một công thức cộng/nhân trọng số vô hướng duy nhất khiến:
+- Một hàm tiện ích (Hub node) sinh ra 50 đường đi trùng lặp chiếm sạch Top 50, và
+- Các chuỗi vòng lặp sâu ($12^d$) đè bẹp các lỗi gọi trực tiếp Disk I/O, Binder IPC ở bậc $O(1)$,
+
+hệ thống mới xử lý theo **Pipeline 4 Bước Bất biến theo Dự án**:
+1. **Bước 1 — Đếm Đại lượng Vật lý AST (`Objective AST Metrics`)**: Tại mỗi hàm, Tree-sitter đếm trực tiếp số câu lệnh thực thi (`stmt_count`), độ phức tạp rẽ nhánh Cyclomatic (`branch_count`), số lệnh cấp phát bộ nhớ (`alloc_count`), và phân cấp phần cứng chặn (`blocking_tier` $\in \{0, 1, 2, 3\}$).
+2. **Bước 2 — Trích xuất Hàng trăm Call Flow & Gom cụm Điểm cuối (`Endpoint Canonicalization`)**: Từ Call Graph, liệt kê mọi chuỗi Call Flow có nguy cơ từ `UI Entry Point` nhưng **gom tất cả các đường đi có cùng `(culprit_endpoint_fqn, issue_category)` vào 1 đại diện duy nhất có số bước nhảy ngắn nhất**. Nhờ vậy, 1.000 đường đi thô được cô đọng thành **100 - 250 Call Flow hoàn toàn độc lập**.
+3. **Bước 3 — Tính Vector Độ phức tạp 4 Chiều & Lột vỏ Đường biên Pareto (`Pareto Skyline Peeling`)**: Mỗi Call Flow được biểu diễn bằng vector 4 chiều khách quan $\vec{C}(\pi) = (D(\pi), B(\pi), W(\pi), R(\pi))$. Dùng thuật toán **Phân lớp Đường biên Pareto có Phân tầng (Stratified Pareto Skyline)** để rút ra **Top 45 - 60 Call Flow** chứa toàn bộ các cực trị nguy hiểm ở mọi chiều mà không cần bất kỳ hệ số nhân cảm tính nào.
+4. **Bước 4 — Phễu Thẩm định AI 2 Pha (`2-Stage Batch AI Funnel`)**:
+   - **Pha 1 (`Batch Structural Triage`)**: Gộp **15 Call Flows vào 1 lần gọi Gemini CLI** dưới dạng bản tóm tắt cấu trúc 12 dòng (`Compact Flow Digest`). Quét sạch 60 Call Flows chỉ tốn **4 lần gọi Gemini CLI (~30 giây)** để lọc ra 8 - 15 lỗi thật sự (`HIGH_CONFIDENCE_ISSUE`).
+   - **Pha 2 (`Deep 5-Gate Audit & QA Test Generator`)**: Chỉ chạy `Spine Slicer` 250 dòng và Prompt 5 Cổng trên 8 - 15 lỗi đã vượt qua Pha 1 để sinh bản vá `refactoring_diff_suggestion` và kịch bản `qa_test_case`.
+
+================================================================================
+## 2. PHÂN HỆ 1: ĐẾM ĐẠI LƯỢNG VẬT LÝ AST TRONG `core/parser.py` & `core/models.py`
+================================================================================
+
+### 2.1. Bổ sung trường vào `FunctionSummary` (`core/models.py`)
+Thêm 4 trường khách quan (đếm trực tiếp từ cây AST, không phụ thuộc cấu hình trọng số):
+```python
+@dataclass
+class FunctionSummary:
+    # ... các trường hiện có ...
+    stmt_count: int = 1                # Số lượng câu lệnh thực thi trong thân hàm
+    branch_count: int = 0              # Độ phức tạp rẽ nhánh McCabe (if, when, switch, &&, ||, ?:)
+    alloc_count: int = 0               # Số lệnh khởi tạo đối tượng / mảng / list / nối chuỗi
+    blocking_tier: int = 0             # 0=Pure CPU, 1=CPU Lib/Regex/JSON, 2=IPC/GFX/Inflate, 3=Disk/DB/Block/Lock
+```
+
+### 2.2. Quy tắc đếm trên Tree-sitter AST (`core/parser.py`)
+Khi duyệt thân hàm trong Pass 2 (`parse_source`):
+1. **`stmt_count`**: Đếm số node biểu thức thực thi (`expression_statement`, `local_variable_declaration`, `property_declaration`, `return_statement`, `assignment_expression`, `call_expression`, `method_invocation`).
+2. **`branch_count` (Cyclomatic Complexity $V(G)$)**: Đếm số node điều kiện rẽ nhánh (`if_statement`, `if_expression`, `when_entry`, `switch_block_statement_group`, `catch_clause`, `ternary_expression`, `elvis_expression`, và các toán tử logic `&&`, `||`).
+3. **`alloc_count`**: Đếm số node cấp phát bộ nhớ mới (`object_creation_expression` trong Java, gọi Constructor viết hoa chữ cái đầu hoặc `listOf`, `mutableListOf`, `arrayListOf`, `hashMapOf`, `.map {`, `.filter {`, `.sortedBy {`, `StringBuilder` trong Kotlin).
+4. **`blocking_tier` ($\in \{0, 1, 2, 3\}$)** trong `core/stitcher.py`:
+   Ánh xạ các danh mục trong `android_sinks.json` về đúng 4 cấp độ vật lý (Ordinal Tiers):
+   - **`Tier 3` (Chặn Cứng Luồng / Đĩa / DB / Khóa)**: `THREAD_BLOCKING_ANR`, `DISK_AND_DB_IO`, `DATABASE_QUERY_IN_LOOP`, `HIDDEN_DNS_AND_SOCKET_BLOCKING`, hoặc hàm dính cờ `CROSS_THREAD_LOCK_CONTENTION`.
+   - **`Tier 2` (Chặn Liên tiến trình IPC / Đồ họa / HAL / Giao diện)**: `BINDER_IPC`, `HEAVY_GRAPHICS_AND_DOCUMENT_IO`, `FRAMEWORK_AND_HAL_COLD_STALLS`, `CRYPTO_KEYSTORE_AND_COMPRESSION`, `MAIN_THREAD_LAYOUT_INFLATION`, `LIFECYCLE_LISTENER_ACCUMULATION`.
+   - **`Tier 1` (Thư viện Tốn CPU / Cấp phát / Bố cục)**: `CPU_SERIALIZATION_AND_REGEX`, `UI_LAYOUT_THRASHING_AND_REBIND`, `RESOURCE_AND_ASSET_THRASHING`, `IPC_BUNDLE_AND_PARCEL_BLOAT`, `JNI_AND_THREAD_CREATION_OVERHEAD`, `COMPOSE_RECOMPOSITION_AND_SUBOPTIMAL_LOOP`.
+   - **`Tier 0` (Thuần Thuật toán Code Nội bộ)**: Hàm không gọi bất kỳ API Sink nào (chỉ chứa code thuật toán Java/Kotlin nội bộ).
+
+================================================================================
+## 3. PHÂN HỆ 2: LIỆT KÊ CALL FLOW & GOM CỤM ĐIỂM CUỐI (`core/pareto_ranker.py`)
+================================================================================
+Tạo file mới `core/pareto_ranker.py` thực hiện việc trích xuất hàng trăm Call Flow độc lập và xếp hạng bằng Đường biên Pareto.
+
+### 3.1. Thuật toán Liệt kê Call Flow & Gom cụm Điểm cuối (`enumerate_canonical_call_flows`)
+Thay vì chỉ lấy 1 đường đi mỗi UI Entry Point, hãy duyệt đồ thị từ tất cả các `UI Entry Point` (`is_ui_entry == True`) theo chiều rộng/sâu có giới hạn (`max_hops = 8`), bỏ qua hoàn toàn các cạnh `edge_thread_context IN ('SWITCH_TO_BG', 'WORKER_BG')` và các hàm thuộc `NOT_IN_BUILD` (`scope_marks == 0`):
+
+1. **Điều kiện Thu nhận một Call Flow Ứng viên $\pi = (v_0 \xrightarrow{e_0} v_1 \dots \xrightarrow{e_{k-1}} v_k)$**:
+   Một đường đi kết thúc tại $v_k$ được thu nhận nếu thỏa mãn **ít nhất 1 trong 3 tiêu chí cấu trúc**:
+   - **Tiêu chí A (Chạm Sink Phần cứng / Hệ thống)**: `v_k.blocking_tier >= 1`.
+   - **Tiêu chí B (Thuật toán Liên hàm / Nội hàm Bậc cao $O(N^2), O(N^3)$)**: Tổng số vòng lặp động (không tính `CONST_SMALL`) dọc theo đường đi cộng với vòng lặp nội bộ của $v_k$ đạt $D(\pi) \ge 2$.
+   - **Tiêu chí C (Vòng lặp Đơn có Thân hàm Phức tạp)**: $D(\pi) == 1$ VÀ khối lượng lệnh nội bộ của $v_k$ lớn ($\text{stmt\_count}(v_k) + 2 \cdot \text{branch\_count}(v_k) + 4 \cdot \text{alloc\_count}(v_k) \ge 25$).
+
+2. **Gom Cụm theo Điểm cuối (`Endpoint Canonicalization`) — Chống Nhân bản Đường đi**:
+   - Nhiều đường đi từ các màn hình khác nhau sẽ cùng dẫn tới 1 hàm thủ phạm $v_k$.
+   - Định nghĩa khóa gom cụm: `cluster_key = (v_k.fqn, primary_sink_or_algo_type)`.
+   - Trong mỗi cụm `cluster_key`, chỉ giữ lại **1 Call Flow Đại diện Tốt nhất** theo thứ tự ưu tiên từ điển (Lexicographic Order):
+     1. Thuộc `BUILT` scope (`len(not_in_build_nodes) == 0`).
+     2. Có bậc vòng lặp động $D(\pi)$ trên đường dẫn tới $v_k$ lớn nhất.
+     3. Xuất phát từ `UI_Phase_Tier(v_0)` cao nhất (`Render/Scroll = 3` > `Lifecycle = 2` > `Interaction = 1`).
+     4. **Số bước nhảy `len(call_chain)` NGẮN NHẤT** (đường ngắn nhất từ UI tới lỗi luôn dễ hiểu nhất và ít bị nhánh `if` chặn nhất!).
+   - Ghi nhận tổng số đường đi cùng trỏ vào cụm này vào trường `hp.cluster_clone_count` (ví dụ: `"Called from 18 UI paths"`).
+
+### 3.2. Tính Vector Độ phức tạp 4 Chiều $\vec{C}(\pi) = (D, B, W, R)$ cho mỗi Call Flow
+Với mỗi Call Flow độc lập $\pi = (v_0 \to v_1 \to \dots \to v_k)$, tính 4 chỉ số cấu trúc hoàn toàn không có trọng số ảo:
+
+```python
+@dataclass
+class CallFlowComplexityProfile:
+    hot_path: HotPath
+    family: str                    # "F1_DIRECT_BLOCKING" | "F2_LOOP_WITH_SINK" | "F3_PURE_ALGO_OR_LOCK"
+    asymptotic_order: int          # Chiều 1 - D(pi): Bậc độ phức tạp vòng lặp động (0=O(1), 1=O(N), 2=O(N^2), 3=O(N^3)...)
+    blocking_tier: int             # Chiều 2 - B(pi): Cấp độ chặn phần cứng/OS cao nhất trên chuỗi (0, 1, 2, 3)
+    ast_work_volume: int           # Chiều 3 - W(pi): Khối lượng lệnh AST tích lũy qua các cấp vòng lặp
+    directness_score: float        # Chiều 4 - R(pi): Độ trực tiếp & không bị chặn (UI_Tier / (Hops + 2*Guards))
+    pareto_layer: int = 0          # Lớp đường biên Pareto (1 = Tốt nhất, 2 = Lớp kế tiếp...)
+    cluster_clone_count: int = 1   # Số lượng đường gọi UI khác cùng dẫn về nút thủ phạm này
+```
+
+Công thức tính từng chiều của $\vec{C}(\pi)$:
+1. **Chiều 1 — Bậc Độ phức tạp Tiệm cận `asymptotic_order` ($D(\pi)$)**:
+   - Cộng tổng `local_loop_depth` của các cạnh $e_i$ có `loop_bound_type != CONST_SMALL` dọc theo $\pi$, cộng với `v_k.max_internal_loop_depth` (và cộng thêm `1` nếu có nút trên $\pi$ mang `is_recursive == True`).
+   - Nếu hàm gọi `.contains()`, `.indexOf()`, `.remove()` trên `List` bên trong vòng lặp cấp $\ge 1$, cộng thêm `1` vào `asymptotic_order` (vì bản thân phép duyệt tuyến tính trên `List` là 1 vòng lặp ẩn $O(N)$).
+2. **Chiều 2 — Cấp độ Chặn Phần cứng `blocking_tier` ($B(\pi) \in \{0, 1, 2, 3\}$)**:
+   $$B(\pi) = \max_{v_i \in \pi} \big( \text{blocking\_tier}(v_i) \big)$$
+3. **Chiều 3 — Khối lượng Công việc AST Tích lũy `ast_work_volume` ($W(\pi)$)**:
+   Gọi $d_{\text{acc}}(v_i)$ là tổng số vòng lặp tích lũy từ $v_0$ đến $v_i$ (cộng với vòng lặp nội bộ của $v_i$). Khối lượng lệnh AST được tính bằng:
+   $$W(\pi) = \sum_{i=0}^{k} \big( 1 + d_{\text{acc}}(v_i) \big)^2 \times \Big( \text{stmt\_count}(v_i) + 2 \cdot \text{branch\_count}(v_i) + 4 \cdot \text{alloc\_count}(v_i) \Big)$$
+4. **Chiều 4 — Độ Trực tiếp & Xác suất Chạm lỗi `directness_score` ($R(\pi)$)**:
+   - Gọi $\text{UI\_Tier}(v_0) \in \{3, 2, 1\}$ (`3` cho Render/Scroll như `onDraw`, `onBindViewHolder`, `@Composable`; `2` cho Lifecycle như `onCreate`, `onResume`; `1` cho Interaction như `onClick`).
+   - Gọi $\text{hops} = \max(1, k)$ là số bước nhảy từ gốc tới nút lá.
+   - Gọi $\text{guards}$ là số hàm trung gian trên $\pi$ có `has_early_return_guard == True`.
+   $$R(\pi) = \frac{\text{UI\_Tier}(v_0)}{\text{hops} + 1.5 \times \text{guards}}$$
+
+### 3.3. Thuật toán Lột vỏ Đường biên Pareto Phân tầng (`StratifiedParetoRanker`)
+Để đảm bảo các lỗi **Gọi I/O trực tiếp ngoài vòng lặp ($D=0, B=3$)**, các lỗi **Gọi Sink trong vòng lặp ($D \ge 1, B \ge 1$)**, và các lỗi **Thuật toán thuần túy / Khóa ($D \ge 2$ hoặc Lock Contention)** không bao giờ chèn ép nhau trên bất kỳ dự án nào:
+
+1. Chia các `CallFlowComplexityProfile` vào 3 Họ Độc lập (3 Orthogonal Families):
+   - **`F1_DIRECT_BLOCKING`**: Các Call Flow có $D(\pi) == 0$ và $B(\pi) \ge 2$ (Gọi trực tiếp Disk I/O, DB, Binder IPC, Bitmap, HAL Stall hoặc `runBlocking` trên Main Thread mà không có vòng lặp).
+   - **`F2_LOOP_WITH_SINK`**: Các Call Flow có $D(\pi) \ge 1$ và $B(\pi) \ge 1$ (Vòng lặp kết hợp gọi Sink).
+   - **`F3_PURE_ALGO_OR_LOCK`**: Các Call Flow có $D(\pi) \ge 2, B(\pi) == 0$ (Thuật toán $O(N^2), O(N^3)$ thuần CPU/Collection) hoặc có cờ `CROSS_THREAD_LOCK_CONTENTION`.
+2. **Định nghĩa Quan hệ Trội Pareto (`dominates(A, B)`) bên trong từng Họ**:
+   Profile $A$ trội hơn Profile $B$ ($A \succ B$) nếu và chỉ nếu:
+   - $A.D \ge B.D \ \land \ A.B \ge B.B \ \land \ A.W \ge B.W \ \land \ A.R \ge B.R$, VÀ
+   - Có ít nhất 1 chiều lớn hơn nghiêm ngặt ($>$).
+3. **Lột vỏ từng Lớp Pareto (`peel_pareto_layers`)**:
+   - Trong mỗi Họ (`F1`, `F2`, `F3`), lặp lại việc tìm tập các điểm không bị điểm nào khác trội hơn để gán `pareto_layer = 1, 2, 3...`.
+   - Sau đó trộn xen kẽ (Round-Robin theo `pareto_layer` từ 1 tăng dần) giữa 3 Họ `F1`, `F2`, `F3` để lấy ra **Top $M$ Call Flows** (mặc định $M = 45$ hoặc $60$ ứng viên cho Pha 1 của AI).
+   - **Kết quả đảm bảo toán học**: Mọi Actual Issue dù thuộc kiểu gọi thẳng I/O ($D=0$), kiểu N+1 Query trong vòng lặp ($D=1, B=3$), hay kiểu thuật toán $O(N^2)$ ($D=2, B=0$) đều nằm ở **Pareto Layer 1 & Layer 2** và luôn lọt vào Top đầu!
+
+================================================================================
+## 4. PHÂN HỆ 3: PHỄU AI 2 PHA — QUÉT 60 CALL FLOWS CHỈ VỚI 4 LẦN GỌI CLI (`ai_verifier/batch_triage.py`)
+================================================================================
+Để giải quyết bài toán: *"Muốn kiểm tra 50 - 80 Call Flows để không sót bất kỳ Actual Issue nào nhưng không muốn tốn 80 lần gọi Gemini CLI"*, hãy tạo module `ai_verifier/batch_triage.py` triển khai **Phễu AI 2 Pha (2-Stage AI Verification Funnel)**:
+
+### 4.1. Pha 1 — Sàng lọc Lô 15 Call Flows / 1 Lần Gọi (`BatchTriageVerifier`)
+1. **Tạo Bản Tóm tắt Cấu trúc 12 Dòng (`build_compact_flow_digest`) cho mỗi Call Flow**:
+   Với mỗi ứng viên trong Top 45 - 60 lấy từ Pareto Ranker, không cần cắt 250 dòng code mà chỉ trích xuất một khối `Digest` siêu gọn (~12-15 dòng):
+   ```text
+   === [CANDIDATE ID: CF-017] ===
+   - Family: F2_LOOP_WITH_SINK | Pareto Layer: 1 | Clones: 12 UI paths
+   - Vector 4D: Order=O(N^2) (D=2) | BlockingTier=2 (BINDER_IPC) | ASTWork=184 | Directness=1.50 (Hops=2, Guards=0)
+   - Call Chain: CameraActivity.onResume/0 --[L88, loop=0]--> FilterController.refresh/1 --[L42, forEach(PARAM), loop=1]--> PackageUtils.checkApp/1 --[L19, for(PARAM), loop=1]--> PackageManager.getApplicationInfo
+   - Path Guards: [Hop 1 L39: if (isFilterSupported)]
+   - Focal Code at Culprit (PackageUtils.checkApp/1, lines 15-26):
+     /* L15 */ fun checkApp(pkgList: List<String>): Boolean {
+     /* L18 */   for (pkg in pkgList) {
+     /* L19 */     val info = pm.getApplicationInfo(pkg, 0)
+     /* L22 */   }
+     /* L25 */ }
+   ```
+   *(Lưu ý: Bắt buộc chạy `DLPAirlock.redact()` trên khối `Focal Code` trước khi ghép vào lô).*
+
+2. **Gửi Lô 15 Candidates trong 1 Lần gọi `gemini -p` (`triage_batch`)**:
+   - Chia 60 ứng viên thành 4 lô (mỗi lô 15 ứng viên).
+   - Chạy song song bằng `ThreadPoolExecutor(max_workers=2)`.
+   - **Prompt Pha 1 (`BATCH_TRIAGE_SYSTEM_PROMPT` & `BATCH_TRIAGE_STDIN_TEMPLATE`)**:
+     Yêu cầu Gemini CLI đánh giá nhanh từng `CANDIDATE ID` trong lô và phân vào 1 trong 3 nhãn:
+     - `"PROMOTE_TO_DEEP_AUDIT"`: Không có cache $O(1)$ chặn trước, không chạy trên background thread, kích thước vòng lặp hoặc chi phí I/O/IPC có khả năng gây Jank/ANR thực tế $\to$ Đưa sang Pha 2!
+     - `"FILTERED_SAFE_GUARDED_OR_TINY"`: Có biến cache/memoization chặn ngay đầu hàm hoặc vòng lặp duyệt qua hằng số cực nhỏ ($\le 3$ phần tử cố định).
+     - `"FILTERED_BACKGROUND_THREAD"`: Thực chất đang chạy trên luồng nền (Executor / HandlerThread / IO Dispatcher).
+   - Định dạng trả về của Pha 1 là một mảng JSON cực nhẹ:
+     ```json
+     {
+       "decisions": [
+         {
+           "candidate_id": "CF-017",
+           "action": "PROMOTE_TO_DEEP_AUDIT",
+           "quick_reason": "Calls Binder IPC getApplicationInfo inside nested loop without caching on Main Thread"
+         }
+       ]
+     }
+     ```
+
+### 4.2. Pha 2 — Phân tích Chuyên sâu 5 Cổng & Sinh QA Test Case cho các Call Flow Chiến thắng
+- Lấy danh sách các Call Flow được gán nhãn `"PROMOTE_TO_DEEP_AUDIT"` từ Pha 1 (thông thường từ 60 ứng viên ban đầu sẽ lọc ra đúng **8 - 15 Actual Issues chất lượng cao nhất**, hoặc giới hạn bởi `--top-k`).
+- Chỉ trên 8 - 15 Call Flow này, hệ thống mới chạy `WitnessSlicer.slice_hotpath()` (Spine Slicing 250 dòng) + `GeminiCLIVerifier.verify_slice()` (Prompt 5 Cổng CEGAR) để sinh:
+  - Phân tích chi tiết từng bước nhảy (`hop_by_hop_audit`).
+  - Đoạn code sửa lỗi xuyên tầng (`refactoring_diff_suggestion`).
+  - Kịch bản kiểm thử 4 chiều cho Tester (`qa_test_case`).
+
+================================================================================
+## 5. CẬP NHẬT CLI & BÁO CÁO HTML (`cli.py` & `reporters/html_reporter.py`)
+================================================================================
+1. Trong `cli.py`:
+   - Thêm cờ `--ranking-mode {pareto,legacy}` (mặc định là `pareto`).
+   - Thêm cờ `--batch-triage-pool <int>` (mặc định `60`: lấy Top 60 Call Flows độc lập từ Đường biên Pareto đưa vào Pha 1 Batch Triage, sau đó lấy các Call Flow đạt `"PROMOTE_TO_DEEP_AUDIT"` tối đa `--top-k` để chạy Pha 2 Deep Audit).
+2. Trong `reporters/html_reporter.py`:
+   - Trên mỗi thẻ Hot Path, hiển thị rõ **Vector Độ phức tạp 4 Chiều**:
+     * `Asymptotic Order`: `O(1)` / `O(N)` / `O(N^2)` / `O(N^3)`
+     * `Blocking Tier`: `Tier 3 (Disk/DB/Lock)` / `Tier 2 (IPC/GFX)` / `Tier 1 (CPU/JSON)` / `Tier 0 (Pure Algo)`
+     * `AST Work Volume`: `<W> weighted AST ops`
+     * `Pareto Layer`: `Layer #1 (Optimal Frontier)` + Badge `"Affects <cluster_clone_count> UI Call Paths"`.
+
+================================================================================
+## 6. YÊU CẦU KIỂM THỬ (`tests/test_pareto_and_batch_funnel.py`)
+================================================================================
+Hãy viết bộ test `pytest` kiểm tra đủ 4 tính chất sau:
+1. **Test Chống Nhân bản Đường đi (`Endpoint Canonicalization`)**: Tạo 25 hàm `Activity1.onCreate` ... `Activity25.onCreate` cùng gọi vào 1 hàm lỗi `SharedPrefsHelper.saveSync()`. Kiểm tra bộ trích xuất gom cả 25 đường đi này thành **đúng 1 Call Flow đại diện duy nhất** (với `cluster_clone_count == 25`), không để 25 đường này chiếm hết bảng xếp hạng.
+2. **Test Bất biến Đường biên Pareto Giữa Các Họ Lỗi (`Stratified Pareto Skyline`)**:
+   Đưa vào 3 Call Flow hoàn toàn khác bản chất:
+   - `Flow A`: Gọi thẳng `SQLiteDatabase.rawQuery` ngay sau 1 bước nhảy từ `onResume` nhưng không có vòng lặp ($D=0, B=3, R=2.0$).
+   - `Flow B`: Có 3 vòng lặp lồng nhau $O(N^3)$ xử lý mảng số nguyên lớn trong `onBindViewHolder` nhưng không gọi bất kỳ API Sink nào ($D=3, B=0, W=450$).
+   - `Flow C`: Có 1 vòng lặp gọi `PackageManager.getApplicationInfo` trong `onBindViewHolder` ($D=1, B=2, W=90, R=2.5$).
+   Kiểm tra `StratifiedParetoRanker` phải xếp **cả 3 Flow A, B, C vào `pareto_layer == 1`** (không có Flow nào bị rớt xuống cuối bảng dù không dùng bất kỳ trọng số `sink_cost` cảm tính nào).
+3. **Test Đếm Khối lượng Công việc AST (`AST Work Volume`)**: Một hàm có vòng lặp chứa 15 câu lệnh, 4 nhánh `if` và 3 lệnh khởi tạo đối tượng mới phải có `ast_work_volume` cao hơn hẳn một hàm có vòng lặp chỉ chứa 1 lệnh gán biến đơn giản.
+4. **Test Phễu AI 2 Pha (`BatchTriageVerifier`)**: Giả lập 30 Call Flows đi vào Pha 1 (chia làm 2 lô, mỗi lô 15 cái), kiểm tra `subprocess.run` chỉ bị gọi đúng 2 lần ở Pha 1, và chỉ những Call Flow có `action == "PROMOTE_TO_DEEP_AUDIT"` mới tiếp tục gọi sang Pha 2.
