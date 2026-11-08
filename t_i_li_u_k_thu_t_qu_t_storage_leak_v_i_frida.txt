@@ -1,0 +1,838 @@
+================================================================================
+TÀI LIỆU KỸ THUẬT TOÀN DIỆN: HỆ THỐNG GIÁM SÁT & KIỂM CHỨNG STORAGE LEAK
+TRÊN ANDROID (JAVA/KOTLIN) DỰA TRÊN NỀN TẢNG FRIDA (frida/frida)
+================================================================================
+
+MỤC LỤC:
+  PHẦN 1: Hệ sinh thái frida/frida & Bản đồ ánh xạ Module cho bài toán Storage Leak
+  PHẦN 2: Giải phẫu cơ chế Frida bắt sự kiện Tạo/Xóa file trong bộ nhớ RAM
+  PHẦN 3: Bằng chứng mã nguồn Android AOSP về các "Cổ phễu" (Choke Points)
+  PHẦN 4: Nguyên lý Shadow Ledger (Sổ cái đối soát) & 4 Kỹ thuật bắt bẫy rò rỉ
+  PHẦN 5: Ma trận 8 Chốt chặn chuẩn cho dự án Android thuần Kotlin/Java
+  PHẦN 6: Mã nguồn thực chiến hoàn chỉnh (Frida Agent JS + Python Controller)
+  PHẦN 7: Danh mục tài liệu chính thức & Link mã nguồn chứng minh
+
+================================================================================
+PHẦN 1: HỆ SINH THÁI FRIDA/FRIDA & BẢN ĐỒ ÁNH XẠ MODULE
+================================================================================
+
+1.1. Bản chất của repo https://github.com/frida/frida
+--------------------------------------------------------------------------------
+- `frida/frida` là kho lưu trữ trung tâm (umbrella repository) của bộ công cụ
+  Dynamic Binary Instrumentation (DBI).
+- Trong repo `frida/frida` KHÔNG có sẵn một module viết riêng cho "Storage Leak".
+  Thay vào đó, Frida cung cấp động cơ nền tảng (Instrumentation Engine) nằm trong
+  thư mục `subprojects/` để lập trình viên xây dựng bộ giám sát vòng đời file
+  (Shadow Ledger) đè lên trên.
+
+1.2. Ánh xạ các Sub-repositories trong `frida/frida` phục vụ quét Storage Leak
+--------------------------------------------------------------------------------
+1) `frida/frida-java-bridge` (https://github.com/frida/frida-java-bridge)
+   - Vai trò: Thành phần quan trọng nhất cho dự án thuần Kotlin/Java.
+   - Chức năng: Cung cấp `Java.perform()`, `Java.use()`, `.implementation` và
+     `$new()` để đặt chốt chặn (hook) vào các hàm I/O của máy ảo Android ART
+     (`libcore.io.IoBridge`, `java.io.File`, `sun.nio.fs.UnixChannelFactory`,
+     `android.content.ContentResolver`), trích xuất Java Stack Trace và chủ động
+     ném `java.io.IOException` (Fault Injection).
+   - File mã nguồn cốt lõi:
+     + `lib/android.js`: Xử lý cấu trúc bộ nhớ `ArtMethod`, bật cờ `kAccNative`,
+       hủy tối ưu hóa AOT/JIT (`deoptimize`) và chuyển hướng con trỏ hàm JNI.
+     + `lib/class-factory.js`: Quản lý việc bọc class Java, xử lý nạp chồng hàm
+       (`.overloads`) và constructor (`$init`).
+
+2) `frida/frida-gum` (https://github.com/frida/frida-gum)
+   - Vai trò: Engine can thiệp mã máy bậc thấp viết bằng C.
+   - Chức năng: Cung cấp `GumInterceptor` (`Interceptor.attach`) để chặn các hàm
+     POSIX ở tầng C (`libc.so!openat`, `close`, `renameat`, `unlinkat`) trong
+     trường hợp cần mở rộng sang quét thư viện C/C++ JNI; đồng thời nhúng trình
+     chạy JavaScript (QuickJS / V8) vào trong tiến trình ứng dụng.
+   - File mã nguồn cốt lõi:
+     + `gum/guminterceptor.c`: Quản lý danh sách hook và ngăn xếp lời gọi hàm.
+     + `gum/backend-arm64/guminterceptor-arm64.c`: Tạo cầu nhảy `Trampoline` và
+       lưu ngữ cảnh thanh ghi CPU (`GumCpuContext`).
+     + `gum/arch-arm64/gumarm64relocator.c` & `gumarm64writer.c`: Dịch chuyển và
+       ghi đè lệnh máy ARM64 ở đầu hàm.
+
+3) `frida/frida-core` (https://github.com/frida/frida-core)
+   - Vai trò: Quản lý tiến trình, tiêm mã (injection) và truyền thông liên tiến trình.
+   - Chức năng: Điều khiển chế độ `spawn` (đóng băng app ngay khi khởi tạo để gắn
+     hook từ giây đầu tiên không sót file nào), đóng gói `frida-server` /
+     `libfrida-gadget.so` và duy trì kênh giao tiếp `rpc.exports` giữa điện thoại
+     với máy tính.
+
+4) `frida/frida-tools` (https://github.com/frida/frida-tools)
+   - Vai trò: Bộ công cụ dòng lệnh (CLI) viết bằng Python.
+   - Chức năng:
+     + `frida-ps` (`ps.py`): Liệt kê PID và Package Name của ứng dụng trên thiết bị
+       (`frida-ps -Uai`, `frida-ps -Uaj`).
+     + `frida-trace` (`tracer.py`): Tự động sinh khung mã hook trong thư mục
+       `__handlers__/` theo mẫu ký tự đại diện và nạp nóng (hot-reload).
+
+5) `frida/frida-python` (https://github.com/frida/frida-python)
+   - Vai trò: Thư viện điều khiển Frida từ Python (`pip install frida`).
+   - Chức năng: Tự động hóa việc chạy Testcase (kết nối thiết bị, nạp script,
+     reset Sổ cái đầu testcase, tiêm lỗi cưỡng bức và xuất báo cáo JSON cuối
+     testcase).
+
+1.3. Hai phương thức cài đặt phía Thiết bị Test (Device Setup)
+--------------------------------------------------------------------------------
+- Cách 1: Injected Mode qua `frida-server` (Dành cho Máy ảo Emulator / Máy đã Root)
+  + Tải file thực thi `frida-server` đúng kiến trúc CPU (ví dụ `arm64-v8a` hoặc
+    `x86_64`) từ trang Releases của `frida/frida`.
+  + Đẩy vào `/data/local/tmp/frida-server`, cấp quyền `chmod 755` và chạy ngầm.
+  + Ưu điểm: Không cần chỉnh sửa APK hay mã nguồn dự án, kiểm thử được mọi app.
+
+- Cách 2: Embedded Mode qua `libfrida-gadget.so` (Dành cho Máy thật KHÔNG Root)
+  + Nhúng file thư viện `libfrida-gadget.so` vào thư mục `app/src/debug/jniLibs/<abi>/`
+    trong bản build Debug của dự án Android.
+  + Ưu điểm: Hoạt động trên mọi điện thoại vật lý thông thường không cần quyền Root.
+
+
+================================================================================
+PHẦN 2: GIẢI PHẪU CƠ CHẾ FRIDA BẮT SỰ KIỆN TẠO/XÓA FILE TRONG BỘ NHỚ RAM
+================================================================================
+
+2.1. Cơ chế Tầng 1: `frida-java-bridge` đánh tráo `ArtMethod` trong máy ảo ART
+--------------------------------------------------------------------------------
+Khi ứng dụng Kotlin/Java gọi một phương thức (ví dụ `IoBridge.open` hoặc
+`File.delete`), máy ảo Android Runtime (`libart.so`) tra cứu một struct C++ trong
+RAM có tên là `art::ArtMethod`. Khi bạn gán `.implementation = function(...)`,
+module `lib/android.js` của `frida-java-bridge` thực hiện 4 bước:
+
+  Bước 1 - Sao lưu (`Backup ArtMethod`):
+    Định vị địa chỉ struct `ArtMethod` của hàm mục tiêu trong RAM và tạo một bản
+    sao lưu (clone) để có thể gọi lại hàm gốc của hệ điều hành khi cần.
+
+  Bước 2 - Hủy tối ưu hóa (`Deoptimization`):
+    Gọi hàm nội bộ `Instrumentation::Deoptimize` của `libart.so` để vô hiệu hóa
+    các bản biên dịch AOT/JIT hoặc inline, buộc máy ảo ART luôn phải đi qua bảng
+    `ArtMethod` mỗi khi hàm được gọi.
+
+  Bước 3 - Giả lập hàm JNI Native (`Access Flags & Entrypoint Patching`):
+    Sửa trực tiếp trường `access_flags_` của `ArtMethod` gốc bằng cách bật cờ
+    `kAccNative (0x0100)` để biến hàm Java đó thành hàm JNI giả. Đồng thời, ghi đè
+    con trỏ `entry_point_from_jni_` trỏ thẳng vào hàm cầu nối (closure) của Frida
+    trong RAM.
+
+  Bước 4 - Chặn bắt & Chuyển tiếp (`Intercept & Forward`):
+    Khi app gọi hàm, ART nhảy vào cầu nối của Frida -> Frida đẩy tham số lên hàm
+    JavaScript của bạn để ghi vào Sổ cái (`Shadow Ledger`) -> gọi lại bản sao lưu
+    `ArtMethod` để hệ điều hành thực thi thao tác file thật -> trả kết quả về.
+
+2.2. Cơ chế Tầng 2 (Mở rộng): `frida-gum` ghi đè mã máy tại `libc.so`
+--------------------------------------------------------------------------------
+Khi cần bắt ở tầng C (`libc.so!openat`, `unlinkat`), `GumInterceptor` thực hiện:
+  1) Tìm địa chỉ hàm trong bảng ELF Dynamic Symbol của `libc.so` trên RAM.
+  2) Gọi `mprotect()` mở quyền ghi trang nhớ chứa mã máy của hàm.
+  3) Copy 2-4 lệnh Assembly ARM64 đầu tiên (Prologue) sang vùng nhớ đệm `Trampoline`
+     và sửa lại độ lệch địa chỉ qua `GumArm64Relocator`.
+  4) Dùng `GumArm64Writer` ghi đè đầu hàm gốc bằng lệnh nhảy `LDR X16, #8; BR X16`
+     để chuyển hướng CPU sang `onEnter` (đọc đường dẫn ở thanh ghi `x1`, cờ
+     `O_CREAT = 0x40` ở thanh ghi `w2`) và `onLeave` (đọc số hiệu `fd` trả về).
+
+
+================================================================================
+PHẦN 3: BẰNG CHỨNG MÃ NGUỒN ANDROID AOSP VỀ CÁC "CỔ PHỄU" (CHOKE POINTS)
+================================================================================
+
+3.1. Tại sao KHÔNG cần hook 40-50 hàm bề mặt, và tại sao CHỈ hook `IoBridge.open`
+     là chưa đủ?
+--------------------------------------------------------------------------------
+- Trên bề mặt code dự án, lập trình viên có thể tạo/ghi file bằng hàng chục hàm:
+  `FileOutputStream`, `RandomAccessFile`, `FileWriter`, `PrintWriter`,
+  `Files.createTempFile`, `Files.write`, Kotlin `writeBytes`, `writeText`,
+  `copyTo`, hoặc qua thư viện `Okio.sink`, `Glide`, `OkHttp`.
+- Tuy nhiên, trong mã nguồn hệ điều hành Android (AOSP `platform/libcore`), toàn
+  bộ các hàm bề mặt này đều chảy dồn về một số ít "Cổ phễu" (Choke Points) ở đáy
+  tầng Java trước khi xuống tầng C.
+- LƯU Ý QUAN TRỌNG: Hàm `libcore.io.IoBridge.open` chỉ làm nhiệm vụ MỞ/TẠO file
+  cho nhánh `java.io`. Nó KHÔNG bắt được sự kiện Đóng luồng (`close`), Đổi tên
+  (`renameTo`), Xóa file (`delete`), và không bắt được nhánh `java.nio.file.Files`
+  hoặc `File.createTempFile()`. Do đó, cần đặt chốt chặn tại đúng tập hợp các cổ
+  phễu tương ứng với từng giai đoạn vòng đời.
+
+3.2. Bằng chứng từ mã nguồn AOSP cho 4 Nhánh Tạo/Mở File ở Tầng Java
+--------------------------------------------------------------------------------
+1) Nhánh 1: `libcore.io.IoBridge.open(String path, int flags, int mode)`
+   - Bằng chứng AOSP: Trong `ojluni/src/main/native/FileInputStream.c`, các kỹ sư
+     Google đã loại bỏ hàm `open0` gốc của OpenJDK với ghi chú:
+     `// BEGIN Android-removed: Open files using IoBridge to share BlockGuard & StrictMode logic.`
+     Trong `FileOutputStream.java`, mọi constructor nhận `File` hoặc `String` đều
+     hội tụ về:
+     `this.fd = IoBridge.open(file.getAbsolutePath(), mode);`
+   - Phạm vi tóm gọn (100% nhánh `java.io` & `kotlin.io`):
+     + `FileOutputStream`, `FileInputStream`, `RandomAccessFile`, `FileWriter`,
+       `PrintWriter`, `Formatter`.
+     + Toàn bộ Kotlin `FilesKt`: `File.writeBytes()`, `File.writeText()`,
+       `File.appendBytes()`, `File.outputStream()`, `File.copyTo()`.
+     + Thư viện bên thứ 3: `Okio.sink()`, `OkHttp` DiskCache, `Glide` DiskLruCache.
+
+2) Nhánh 2: `java.io.UnixFileSystem.createFileExclusively(String path)`
+   - Bằng chứng AOSP: Trong `ojluni/src/main/java/java/io/File.java`, khi ứng dụng
+     gọi `File.createNewFile()` hoặc `File.createTempFile()` (chỉ tạo vỏ file rỗng
+     trên đĩa mà chưa mở Stream ghi dữ liệu), nó không đi qua `IoBridge.open` mà
+     gọi thẳng xuống `fs.createFileExclusively(path)` trong `UnixFileSystem.java`.
+   - Phạm vi tóm gọn: 100% lệnh gọi `File.createTempFile()`, `File.createNewFile()`
+     và `kotlin.io.createTempFile()`.
+
+3) Nhánh 3: `sun.nio.fs.UnixChannelFactory.open(...)`
+   - Bằng chứng AOSP: Trong `ojluni/src/main/java/sun/nio/fs/UnixChannelFactory.java`,
+     toàn bộ các hàm thuộc gói Java NIO.2 (`java.nio.file.Files` từ Android 8.0+)
+     như `Files.createTempFile()`, `Files.createFile()`, `Files.newByteChannel()`,
+     `Files.newOutputStream()`, `Files.write()` đều hội tụ về hàm `open()` của
+     `UnixChannelFactory` (sau đó gọi xuống `UnixNativeDispatcher.open` / `openat`).
+   - Phạm vi tóm gọn: 100% nhánh `java.nio.file.Files.*`.
+
+4) Nhánh 4: `android.content.ContentResolver` (`insert`, `update`, `delete`)
+   - Bằng chứng Android Docs & AOSP: Từ Android 10 (API 29) với cơ chế Scoped
+     Storage, khi ứng dụng tạo file media trong bộ nhớ chung qua `MediaStore` với
+     cờ `MediaStore.MediaColumns.IS_PENDING = 1`, tiến trình của app gửi yêu cầu
+     IPC Binder sang nhờ tiến trình `MediaProvider` tạo file ẩn `.pending-*`. Nếu
+     app không gọi `update()` để hạ `IS_PENDING = 0` hoặc `delete()`, file ẩn này
+     sẽ bị rò rỉ vĩnh viễn trên thiết bị.
+
+
+================================================================================
+PHẦN 4: NGUYÊN LÝ SHADOW LEDGER (SỔ CÁI ĐỐI SOÁT) & 4 KỸ THUẬT ĐẶC TRỊ
+================================================================================
+
+4.1. Nguyên lý hoạt động của Shadow Ledger (Sổ cái kế toán kép trong RAM)
+--------------------------------------------------------------------------------
+Hệ điều hành chỉ biết file đang nằm trên ổ cứng, không biết "hàm nào đã đẻ ra file
+đó" và "luồng đọc/ghi nào đang khóa nó". Shadow Ledger là một cấu trúc `Map` nằm
+trong bộ nhớ của Frida Agent, thực hiện quy trình 4 bước:
+
+  1) GHI NỢ (Khi Tạo File):
+     Khi bất kỳ cổ phễu tạo file nào kích hoạt với đường dẫn thuộc vùng tạm
+     (`/cache/`, `/code_cache/`, `/tmp`, `.tmp`, `.temp`, `.part`), Frida lấy
+     đường dẫn chuẩn hóa làm Key, lưu trạng thái `CREATED_EPHEMERAL`, thời gian
+     tạo và chụp ngay Java Call Stack (`Log.getStackTraceString(new Exception())`).
+
+  2) THEO DÕI BIẾN ĐỘNG QUA MÓC XÍCH `fd.getInt$()`:
+     - Trên Android, mỗi đối tượng `java.io.FileDescriptor` có phương thức ẩn
+       `getInt$()` trả về số nguyên FD của hệ điều hành (ví dụ `fd = 72`).
+     - Khi mở luồng ở `IoBridge.open`: Ghi nhận `fdInt = 72` đang mở cho đường dẫn
+       đó (kèm Stack Trace mở luồng).
+     - Khi đóng luồng ở `IoBridge.closeAndSignalBlockedThreads`: Đọc lại
+       `fdObj.getInt$()`, xóa `72` khỏi danh sách luồng đang mở của file đó.
+     - Khi đổi tên ở `File.renameTo()`: Nếu file tạm `.tmp` được đổi tên sang thư
+       mục lưu trữ chính thức, xóa khỏi Sổ cái để chống báo lỗi giả (False Positive).
+
+  3) GHI CÓ / TẤT TOÁN (Khi Xóa File):
+     Khi `File.delete()` hoặc `Files.deleteIfExists()` trả về `true` (hoặc
+     `IS_PENDING` được hạ về `0`), Frida xóa bản ghi khỏi Sổ cái (Có vay - Có trả).
+
+  4) KIỂM TOÁN (Audit cuối màn hình hoặc cuối Testcase):
+     Khi `Activity.onDestroy()` chạy hoặc khi kết thúc Testcase, mọi bản ghi còn
+     sót lại trong Sổ cái (mà file thực tế vẫn còn trên đĩa hoặc `openFds.size > 0`)
+     đều là rò rỉ xác thực 100% kèm đầy đủ Stack Trace thủ phạm.
+
+4.2. Máy trạng thái vòng đời File (6 Trạng thái chuẩn)
+--------------------------------------------------------------------------------
+  [CREATED_EPHEMERAL] $\rightarrow$ [STREAM_LOCKED] $\rightarrow$ [STAGED_FOR_COPY]
+          |                       |                       |
+          +-----------------------+-----------------------+
+                                  |
+         +------------------------+------------------------+
+         | (Đóng đủ Stream & Xóa/Promote thành công)       | (Quên xóa / Xóa lỗi / Treo Stream)
+         v                                                 v
+  [CLEANED / PROMOTED] (An toàn)                    [LEAKED_CONFIRMED] (Báo lỗi)
+
+4.3. Bốn (04) Kỹ thuật Đặc trị bắt các bẫy rò rỉ tinh vi
+--------------------------------------------------------------------------------
+1) Kỹ thuật 1 - Bắt bẫy "Stream Lock & Xóa thất bại âm thầm":
+   - Vấn đề: Trong Java, `File.delete()` KHÔNG ném Exception khi xóa thất bại mà
+     chỉ âm thầm trả về `false`. Nếu lập trình viên gọi `tempFile.delete()` khi
+     chưa gọi `stream.close()` (hoặc xóa nhầm), lỗi bị nuốt mất.
+   - Giải pháp Frida: Hook `File.delete()`, kiểm tra nếu giá trị trả về là `false`
+     trên một file đang tồn tại, hoặc xóa khi `openFds.size > 0`, lập tức cảnh báo
+     kèm theo cả Stack Trace nơi gọi `delete()` lẫn Stack Trace nơi mở Stream chưa đóng.
+
+2) Kỹ thuật 2 - Bắt bẫy "Copy / Move Staging Trap" (Rò rỉ file trung gian):
+   - Vấn đề: App tạo `temp_raw.tmp`, dùng `File.copyTo()` của Kotlin (hoặc
+     `FileChannel.transferTo` / `Files.copy`) chép sang `final.jpg` rồi bỏ quên
+     không xóa `temp_raw.tmp`.
+   - Giải pháp Frida: Ngay tại cổ phễu `IoBridge.open`, Frida kiểm tra theo
+     `Thread.currentThread().getId()`. Nếu cùng một Thread đang mở một FD ở chế độ
+     ĐỌC (`O_RDONLY`) trỏ vào một file tạm trong Sổ cái, và ngay lập tức mở tiếp
+     một FD thứ hai ở chế độ GHI (`O_CREAT` / `O_WRONLY`) sang đường dẫn khác,
+     Frida tự động gắn nhãn `STAGED_FOR_COPY` cho file nguồn. Nếu sau đó file đích
+     đã đóng mà file nguồn không được xóa -> Bắt sống lỗi Copy Trap.
+
+3) Kỹ thuật 3 - Bắt bẫy "Trì hoãn xóa" (`File.deleteOnExit()`):
+   - Vấn đề: `File.deleteOnExit()` không xóa file ngay mà nhét đường dẫn vào một
+     `LinkedHashSet` tĩnh trong RAM (`java.io.DeleteOnExitHook`), giữ file rác trên
+     ổ cứng suốt phiên dùng app và mất tác dụng nếu app bị crash hoặc force-kill.
+   - Giải pháp Frida: Hook `File.deleteOnExit()` để gắn cờ cảnh báo
+     `DEFERRED_DELETE_ON_EXIT_TRAP`.
+
+4) Kỹ thuật 4 - Bẻ nhánh thực thi bằng Fault Injection (Kiểm chứng `try-catch-finally`):
+   - Vấn đề: Nếu lệnh `tempFile.delete()` đặt ở cuối khối `try` thay vì `finally`,
+     khi chạy testcase bình thường (Happy Path) không có lỗi xảy ra nên file vẫn
+     được xóa, làm lọt lỗi.
+   - Giải pháp Frida: Đặt chốt tại `libcore.io.IoBridge.write`. Khi bật chế độ
+     Fault Injection qua RPC, ngay khi app ghi vào file tạm mục tiêu, Frida chủ
+     động `throw IOException.$new("Frida Simulated Disk Full")` để ép máy ảo ART
+     nhảy thẳng vào khối `catch`. Nếu sau cú nhảy đó file tạm không được xóa,
+     chứng minh 100% khối `catch`/`finally` bị thiếu logic dọn rác.
+
+
+================================================================================
+PHẦN 5: MA TRẬN 8 CHỐT CHẶN CHUẨN CHO DỰ ÁN THUẦN KOTLIN/JAVA
+================================================================================
+
++----+---------------------------------------------------+--------------------------------------------------+
+| #  | Điểm đặt Hook (`frida-java-bridge`)               | Nhiệm vụ & Phạm vi bao phủ                       |
++----+---------------------------------------------------+--------------------------------------------------+
+| 1  | `libcore.io.IoBridge.open`                        | Bắt 100% tạo/mở file nhánh `java.io`, `kotlin.io`|
+|    |                                                   | (`writeBytes`, `copyTo`), Okio, Glide + Phát     |
+|    |                                                   | hiện tự động hành vi Copy giữa 2 file.           |
++----+---------------------------------------------------+--------------------------------------------------+
+| 2  | `java.io.UnixFileSystem.createFileExclusively`    | Bắt 100% `File.createTempFile()`,                |
+|    |                                                   | `File.createNewFile()`, Kotlin `createTempFile`. |
++----+---------------------------------------------------+--------------------------------------------------+
+| 3  | `sun.nio.fs.UnixChannelFactory.open`              | Bắt 100% nhánh Java NIO.2 (`java.nio.file.Files`)|
++----+---------------------------------------------------+--------------------------------------------------+
+| 4  | `libcore.io.IoBridge.closeAndSignalBlockedThreads`| Theo dõi đóng FD (`fd.getInt$()`) để bắt lỗi     |
+|    | & `sun.nio.ch.FileChannelImpl.implCloseChannel`   | quên gọi `.close()` (Stream Lock).               |
++----+---------------------------------------------------+--------------------------------------------------+
+| 5  | `java.io.File.renameTo` & `java.nio.file.Files.move`| Theo dõi đổi tên/di chuyển file tạm sang file  |
+|    | & `java.nio.file.Files.copy`                      | chính thức để loại bỏ báo lỗi giả (False Pos).   |
++----+---------------------------------------------------+--------------------------------------------------+
+| 6  | `java.io.File.delete`, `File.deleteOnExit`,       | Tất toán Sổ cái khi xóa thành công; bắt lỗi      |
+|    | `java.nio.file.Files.deleteIfExists` / `delete`   | `delete()` trả về `false` và bẫy `deleteOnExit`. |
++----+---------------------------------------------------+--------------------------------------------------+
+| 7  | `android.content.ContentResolver`                 | Bắt rò rỉ file ẩn `.pending` trên Scoped Storage |
+|    | (`insert`, `update`, `delete`)                    | (Android 10+) khi `is_pending = 1` bị bỏ rơi.    |
++----+---------------------------------------------------+--------------------------------------------------+
+| 8  | `libcore.io.IoBridge.write`                       | Chốt tiêm lỗi cưỡng bức (`Fault Injection` ném   |
+|    | & `android.app.Activity.onDestroy`                | `IOException`) và chốt kiểm toán cuối màn hình.  |
++----+---------------------------------------------------+--------------------------------------------------+
+
+
+================================================================================
+PHẦN 6: MÃ NGUỒN THỰC CHIẾN HOÀN CHỈNH (FRIDA AGENT + PYTHON RUNNER)
+================================================================================
+
+--------------------------------------------------------------------------------
+6.1. File Agent JavaScript: `pure_kotlin_storage_leak.js`
+--------------------------------------------------------------------------------
+```javascript
+/**
+ * pure_kotlin_storage_leak.js
+ * Hệ thống giám sát và kiểm chứng động Storage Leak 100% frida-java-bridge
+ * Dành cho dự án Android thuần Kotlin / Java
+ */
+
+const Ledger = {
+    // key: canonicalOrAbsPath -> { state, createdAt, creationStack, openFds: Map<fdInt, stack>, copiedTo: [], notes: [] }
+    files: new Map(),
+    // key: fdInt -> { path, isReadOnly, threadId, openStack }
+    activeFds: new Map(),
+    // key: uriString -> { createdAt, creationStack }
+    pendingUris: new Map(),
+    // Cấu hình tiêm lỗi cưỡng bức (Fault Injection)
+    fault: {
+        enabled: false,
+        targetMatch: "",
+        failAfterWrites: 1,
+        count: 0
+    }
+};
+
+function getStack() {
+    const Log = Java.use("android.util.Log");
+    const Exception = Java.use("java.lang.Exception");
+    return Log.getStackTraceString(Exception.$new()).trim();
+}
+
+function isTargetEphemeral(path) {
+    if (!path) return false;
+    return (
+        path.includes("/cache/") ||
+        path.includes("/code_cache/") ||
+        path.includes("/tmp") ||
+        path.includes("/temp") ||
+        path.endsWith(".tmp") ||
+        path.endsWith(".temp") ||
+        path.endsWith(".part")
+    );
+}
+
+function trackFileCreation(path, sourceApi, stack) {
+    if (!Ledger.files.has(path)) {
+        Ledger.files.set(path, {
+            state: "CREATED_EPHEMERAL",
+            createdAt: Date.now(),
+            creationStack: stack,
+            openFds: new Map(),
+            copiedTo: [],
+            notes: [`Created via ${sourceApi}`]
+        });
+        console.log(`[+][CREATE] (${sourceApi}) ${path}`);
+    }
+}
+
+Java.perform(function () {
+    const IoBridge = Java.use("libcore.io.IoBridge");
+    const UnixFileSystem = Java.use("java.io.UnixFileSystem");
+    const File = Java.use("java.io.File");
+    const ContentResolver = Java.use("android.content.ContentResolver");
+    const Activity = Java.use("android.app.Activity");
+    const OsConstants = Java.use("android.system.OsConstants");
+    const Thread = Java.use("java.lang.Thread");
+    const IOException = Java.use("java.io.IOException");
+
+    const O_CREAT = OsConstants.O_CREAT.value;
+    const O_ACCMODE = OsConstants.O_ACCMODE.value;
+    const O_RDONLY = OsConstants.O_RDONLY.value;
+
+    // =========================================================================
+    // CHỐT 1: libcore.io.IoBridge.open (Tạo/Mở file java.io, kotlin.io + Copy Trap)
+    // =========================================================================
+    IoBridge.open.overload("java.lang.String", "int", "int").implementation = function (path, flags, mode) {
+        const fdObj = this.open(path, flags, mode);
+        if (!fdObj || !path) return fdObj;
+
+        const fdInt = fdObj.getInt$();
+        const tid = Thread.currentThread().getId();
+        const isCreate = (flags & O_CREAT) !== 0;
+        const isReadOnly = (flags & O_ACCMODE) === O_RDONLY;
+        const stack = (isCreate || isTargetEphemeral(path)) ? getStack() : null;
+
+        if (isCreate && isTargetEphemeral(path)) {
+            trackFileCreation(path, "IoBridge.open", stack);
+        }
+
+        // Phát hiện tự động hành vi Copy (ví dụ: Kotlin File.copyTo / InputStream.copyTo)
+        // Khi cùng 1 Thread đang giữ FD đọc của 1 file tạm và mở tiếp 1 FD ghi sang file khác
+        if (!isReadOnly) {
+            for (const [openFd, info] of Ledger.activeFds.entries()) {
+                if (info.threadId === tid && info.isReadOnly && Ledger.files.has(info.path) && info.path !== path) {
+                    const srcEntry = Ledger.files.get(info.path);
+                    srcEntry.state = "STAGED_FOR_COPY";
+                    if (!srcEntry.copiedTo.includes(path)) {
+                        srcEntry.copiedTo.push(path);
+                    }
+                    srcEntry.notes.push(`Copied data to ${path} on Thread-${tid}`);
+                    console.log(`[~][COPY_TRAP_WATCH] Phát hiện chép dữ liệu từ file tạm ${info.path} -> ${path}`);
+                }
+            }
+        }
+
+        if (Ledger.files.has(path)) {
+            const entry = Ledger.files.get(path);
+            entry.openFds.set(fdInt, stack || getStack());
+            Ledger.activeFds.set(fdInt, { path: path, isReadOnly: isReadOnly, threadId: tid });
+        }
+
+        return fdObj;
+    };
+
+    // =========================================================================
+    // CHỐT 2: UnixFileSystem.createFileExclusively (File.createTempFile & createNewFile)
+    // =========================================================================
+    UnixFileSystem.createFileExclusively.overload("java.lang.String").implementation = function (path) {
+        const created = this.createFileExclusively(path);
+        if (created && isTargetEphemeral(path)) {
+            trackFileCreation(path, "UnixFileSystem.createFileExclusively", getStack());
+        }
+        return created;
+    };
+
+    // =========================================================================
+    // CHỐT 3: UnixChannelFactory.open (Toàn bộ nhánh java.nio.file.Files.*)
+    // =========================================================================
+    try {
+        const UnixChannelFactory = Java.use("sun.nio.fs.UnixChannelFactory");
+        UnixChannelFactory.open.overloads.forEach(function (overload) {
+            overload.implementation = function () {
+                const fdObj = overload.apply(this, arguments);
+                const unixPathObj = arguments[1];
+                if (fdObj && unixPathObj) {
+                    const path = unixPathObj.toString();
+                    if (isTargetEphemeral(path)) {
+                        const stack = getStack();
+                        trackFileCreation(path, "UnixChannelFactory.open (NIO.2)", stack);
+                        const fdInt = fdObj.getInt$();
+                        Ledger.files.get(path).openFds.set(fdInt, stack);
+                        Ledger.activeFds.set(fdInt, {
+                            path: path,
+                            isReadOnly: false,
+                            threadId: Thread.currentThread().getId()
+                        });
+                    }
+                }
+                return fdObj;
+            };
+        });
+    } catch (e) {}
+
+    // =========================================================================
+    // CHỐT 4: Đóng luồng (IoBridge.closeAndSignalBlockedThreads & FileChannelImpl)
+    // =========================================================================
+    IoBridge.closeAndSignalBlockedThreads.overload("java.io.FileDescriptor").implementation = function (fdObj) {
+        if (fdObj && fdObj.valid()) {
+            const fdInt = fdObj.getInt$();
+            if (Ledger.activeFds.has(fdInt)) {
+                const { path } = Ledger.activeFds.get(fdInt);
+                Ledger.activeFds.delete(fdInt);
+                if (Ledger.files.has(path)) {
+                    Ledger.files.get(path).openFds.delete(fdInt);
+                }
+            }
+        }
+        return this.closeAndSignalBlockedThreads(fdObj);
+    };
+
+    try {
+        const FileChannelImpl = Java.use("sun.nio.ch.FileChannelImpl");
+        FileChannelImpl.implCloseChannel.implementation = function () {
+            try {
+                const fdField = this.getClass().getDeclaredField("fd");
+                fdField.setAccessible(true);
+                const fdObj = fdField.get(this);
+                if (fdObj) {
+                    const fdInt = Java.cast(fdObj, Java.use("java.io.FileDescriptor")).getInt$();
+                    if (Ledger.activeFds.has(fdInt)) {
+                        const { path } = Ledger.activeFds.get(fdInt);
+                        Ledger.activeFds.delete(fdInt);
+                        if (Ledger.files.has(path)) {
+                            Ledger.files.get(path).openFds.delete(fdInt);
+                        }
+                    }
+                }
+            } catch (err) {}
+            return this.implCloseChannel();
+        };
+    } catch (e) {}
+
+    // =========================================================================
+    // CHỐT 5: Đổi tên / Di chuyển / Copy NIO (File.renameTo, Files.move, Files.copy)
+    // =========================================================================
+    File.renameTo.implementation = function (dest) {
+        const srcPath = this.getAbsolutePath();
+        const dstPath = dest.getAbsolutePath();
+        const ok = this.renameTo(dest);
+        if (ok && Ledger.files.has(srcPath)) {
+            const entry = Ledger.files.get(srcPath);
+            Ledger.files.delete(srcPath);
+            if (isTargetEphemeral(dstPath)) {
+                entry.notes.push(`Renamed from ${srcPath} to ${dstPath}`);
+                Ledger.files.set(dstPath, entry);
+            } else {
+                console.log(`[v][PROMOTED] File tạm được đổi tên sang lưu trữ chính thức: ${srcPath} -> ${dstPath}`);
+            }
+        }
+        return ok;
+    };
+
+    try {
+        const Files = Java.use("java.nio.file.Files");
+        Files.move.overloads.forEach(function (overload) {
+            overload.implementation = function () {
+                const srcPath = arguments[0].toString();
+                const dstPath = arguments[1].toString();
+                const res = overload.apply(this, arguments);
+                if (Ledger.files.has(srcPath)) {
+                    const entry = Ledger.files.get(srcPath);
+                    Ledger.files.delete(srcPath);
+                    if (isTargetEphemeral(dstPath)) {
+                        entry.notes.push(`Files.move from ${srcPath} to ${dstPath}`);
+                        Ledger.files.set(dstPath, entry);
+                    }
+                }
+                return res;
+            };
+        });
+    } catch (e) {}
+
+    // =========================================================================
+    // CHỐT 6: Xóa file & Bẫy deleteOnExit (File.delete, deleteOnExit, Files.delete*)
+    // =========================================================================
+    File.delete.implementation = function () {
+        const path = this.getAbsolutePath();
+        const entry = Ledger.files.get(path);
+        const deleted = this.delete();
+
+        if (entry) {
+            if (deleted) {
+                if (entry.openFds.size > 0) {
+                    console.log(`[WARNING][UNCLOSED_STREAM_ON_DELETE] Xóa file khi còn ${entry.openFds.size} FD chưa đóng: ${path}`);
+                }
+                Ledger.files.delete(path);
+                console.log(`[-][CLEANED] ${path}`);
+            } else if (this.exists()) {
+                entry.state = "DELETE_FAILED_SILENTLY";
+                entry.notes.push(`File.delete() returned FALSE at:\n${getStack()}`);
+                console.log(`[ALERT][DELETE_FAILED] File.delete() trả về FALSE trên file đang tồn tại: ${path}`);
+            }
+        }
+        return deleted;
+    };
+
+    File.deleteOnExit.implementation = function () {
+        const path = this.getAbsolutePath();
+        if (Ledger.files.has(path)) {
+            const entry = Ledger.files.get(path);
+            entry.state = "DEFERRED_DELETE_ON_EXIT_TRAP";
+            entry.notes.push(`Called deleteOnExit() at:\n${getStack()}`);
+            console.log(`[WARNING][DELETE_ON_EXIT_TRAP] Dùng deleteOnExit() gây tích tụ file rác: ${path}`);
+        }
+        return this.deleteOnExit();
+    };
+
+    try {
+        const Files = Java.use("java.nio.file.Files");
+        Files.deleteIfExists.implementation = function (pathObj) {
+            const path = pathObj.toString();
+            const deleted = this.deleteIfExists(pathObj);
+            if (deleted && Ledger.files.has(path)) {
+                Ledger.files.delete(path);
+                console.log(`[-][CLEANED_NIO] ${path}`);
+            }
+            return deleted;
+        };
+        Files.delete.implementation = function (pathObj) {
+            const path = pathObj.toString();
+            this.delete(pathObj);
+            if (Ledger.files.has(path)) {
+                Ledger.files.delete(path);
+                console.log(`[-][CLEANED_NIO] ${path}`);
+            }
+        };
+    } catch (e) {}
+
+    // =========================================================================
+    // CHỐT 7: Scoped Storage MediaStore (IS_PENDING = 1)
+    // =========================================================================
+    ContentResolver.insert.overload("android.net.Uri", "android.content.ContentValues").implementation = function (uri, values) {
+        const resUri = this.insert(uri, values);
+        if (resUri && values && values.containsKey("is_pending")) {
+            const pending = values.getAsInteger("is_pending");
+            if (pending && pending.intValue() === 1) {
+                Ledger.pendingUris.set(resUri.toString(), {
+                    createdAt: Date.now(),
+                    creationStack: getStack()
+                });
+                console.log(`[+][SCOPED_PENDING_CREATE] ${resUri.toString()}`);
+            }
+        }
+        return resUri;
+    };
+
+    ContentResolver.update.overload("android.net.Uri", "android.content.ContentValues", "java.lang.String", "[Ljava.lang.String;").implementation = function (uri, values, where, args) {
+        const count = this.update(uri, values, where, args);
+        if (uri && values && values.containsKey("is_pending")) {
+            const pending = values.getAsInteger("is_pending");
+            if (pending && pending.intValue() === 0) {
+                Ledger.pendingUris.delete(uri.toString());
+                console.log(`[-][SCOPED_PENDING_COMMITTED] ${uri.toString()}`);
+            }
+        }
+        return count;
+    };
+
+    ContentResolver.delete.overload("android.net.Uri", "java.lang.String", "[Ljava.lang.String;").implementation = function (uri, where, args) {
+        const count = this.delete(uri, where, args);
+        if (uri && Ledger.pendingUris.has(uri.toString())) {
+            Ledger.pendingUris.delete(uri.toString());
+            console.log(`[-][SCOPED_PENDING_DELETED] ${uri.toString()}`);
+        }
+        return count;
+    };
+
+    // =========================================================================
+    // CHỐT 8: Tiêm lỗi cưỡng bức (IoBridge.write) & Kiểm toán (Activity.onDestroy)
+    // =========================================================================
+    IoBridge.write.overload("java.io.FileDescriptor", "[B", "int", "int").implementation = function (fdObj, bytes, offset, count) {
+        if (Ledger.fault.enabled && fdObj) {
+            const fdInt = fdObj.getInt$();
+            if (Ledger.activeFds.has(fdInt)) {
+                const { path } = Ledger.activeFds.get(fdInt);
+                if (path.includes(Ledger.fault.targetMatch)) {
+                    Ledger.fault.count++;
+                    if (Ledger.fault.count >= Ledger.fault.failAfterWrites) {
+                        console.log(`[FAULT_INJECTION] Cưỡng bức ném IOException tại IoBridge.write cho file: ${path}`);
+                        if (Ledger.files.has(path)) {
+                            Ledger.files.get(path).notes.push("Fault Injection threw IOException during write()");
+                        }
+                        throw IOException.$new("Frida Simulated Disk Full / I/O Exception");
+                    }
+                }
+            }
+        }
+        return this.write(fdObj, bytes, offset, count);
+    };
+
+    Activity.onDestroy.implementation = function () {
+        this.onDestroy();
+        const actName = this.getClass().getName();
+        console.log(`\n=== [AUDIT STORAGE LEAK SAU KHI ĐÓNG ${actName}] ===`);
+        console.log(JSON.stringify(exportReport(), null, 2));
+    };
+});
+
+function exportReport() {
+    const File = Java.use("java.io.File");
+    const leaks = [];
+    const scopedLeaks = [];
+
+    Ledger.files.forEach((entry, path) => {
+        let exists = false;
+        let size = 0;
+        Java.performNow(() => {
+            const f = File.$new(path);
+            exists = f.exists();
+            if (exists) size = f.length();
+        });
+        if (exists || entry.openFds.size > 0) {
+            leaks.push({
+                path: path,
+                state: entry.state,
+                existsOnDisk: exists,
+                sizeBytes: size,
+                ageMs: Date.now() - entry.createdAt,
+                unclosedStreamCount: entry.openFds.size,
+                copiedToTargets: entry.copiedTo,
+                creationStack: entry.creationStack,
+                unclosedStreamStacks: Array.from(entry.openFds.values()),
+                notes: entry.notes
+            });
+        }
+    });
+
+    Ledger.pendingUris.forEach((info, uriStr) => {
+        scopedLeaks.push({
+            uri: uriStr,
+            leakType: "ORPHANED_SCOPED_STORAGE_IS_PENDING",
+            ageMs: Date.now() - info.createdAt,
+            creationStack: info.creationStack
+        });
+    });
+
+    return {
+        timestamp: new Date().toISOString(),
+        leakedFilesCount: leaks.length,
+        leakedScopedUrisCount: scopedLeaks.length,
+        leakedFiles: leaks,
+        leakedScopedUris: scopedLeaks
+    };
+}
+
+rpc.exports = {
+    getReport: function () {
+        return exportReport();
+    },
+    clearLedger: function () {
+        Ledger.files.clear();
+        Ledger.activeFds.clear();
+        Ledger.pendingUris.clear();
+        return "[OK] Shadow Ledger cleared for new testcase.";
+    },
+    enableFaultInjection: function (pathSubstring, failAfterWrites) {
+        Ledger.fault.enabled = true;
+        Ledger.fault.targetMatch = pathSubstring || "";
+        Ledger.fault.failAfterWrites = failAfterWrites || 1;
+        Ledger.fault.count = 0;
+        return `[OK] Fault Injection enabled for paths matching "${pathSubstring}"`;
+    },
+    disableFaultInjection: function () {
+        Ledger.fault.enabled = false;
+        return "[OK] Fault Injection disabled";
+    }
+};
+```
+
+--------------------------------------------------------------------------------
+6.2. Script Python Điều khiển theo từng Testcase: `run_storage_leak_test.py`
+--------------------------------------------------------------------------------
+```python
+import frida
+import json
+import time
+
+PACKAGE_NAME = "com.example.targetapp"
+AGENT_SCRIPT = "pure_kotlin_storage_leak.js"
+
+def on_message(message, data):
+    if message["type"] == "send":
+        print(f"[Agent] {message['payload']}")
+    elif message["type"] == "error":
+        print(f"[Agent Error] {message['stack']}")
+
+def main():
+    # 1. Kết nối thiết bị USB và khởi chạy app ở chế độ Spawn (bắt từ giây đầu tiên)
+    device = frida.get_usb_device(timeout=5)
+    print(f"[*] Spawning {PACKAGE_NAME}...")
+    pid = device.spawn([PACKAGE_NAME])
+    session = device.attach(pid)
+
+    with open(AGENT_SCRIPT, "r", encoding="utf-8") as f:
+        script = session.create_script(f.read())
+
+    script.on("message", on_message)
+    script.load()
+    device.resume(pid)
+    time.sleep(3) # Đợi app khởi tạo xong màn hình chính
+
+    # 2. Bắt đầu Testcase 1: Reset Sổ cái để chỉ ghi nhận sự kiện trong Testcase này
+    print("\n--- BẮT ĐẦU TESTCASE 1 (KIỂM TRA NHÁNH EXCEPTION BẰNG FAULT INJECTION) ---")
+    print(script.exports_sync.clear_ledger())
+    print(script.exports_sync.enable_fault_injection("/cache/", 1))
+
+    # [Tại đây: Thực hiện thao tác UI trên app hoặc chạy kịch bản Appium / ADB]
+    print("[*] Đang theo dõi hành vi tạo/xóa file trong 15 giây...")
+    time.sleep(15)
+
+    # 3. Kết thúc Testcase 1: Thu thập báo cáo đối soát từ Shadow Ledger
+    report = script.exports_sync.get_report()
+    print("\n--- KẾT QUẢ KIỂM TOÁN STORAGE LEAK ---")
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+
+    if report["leakedFilesCount"] > 0 or report["leakedScopedUrisCount"] > 0:
+        print(f"[FAIL] Phát hiện {report['leakedFilesCount']} file rác và {report['leakedScopedUrisCount']} URI bị rò rỉ!")
+    else:
+        print("[PASS] Không phát hiện rò rỉ lưu trữ.")
+
+if __name__ == "__main__":
+    main()
+```
+
+
+================================================================================
+PHẦN 7: DANH MỤC TÀI LIỆU CHÍNH THỨC & LINK MÃ NGUỒN CHỨNG MINH
+================================================================================
+
+1. Mã nguồn Hệ sinh thái Frida:
+   - Repo chính: https://github.com/frida/frida
+   - Engine Java/Kotlin (`frida-java-bridge`): https://github.com/frida/frida-java-bridge
+   - Engine Native (`frida-gum`): https://github.com/frida/frida-gum
+   - Công cụ CLI (`frida-tools`): https://github.com/frida/frida-tools
+   - Tài liệu JavaScript API (`Java`, `Interceptor`, `rpc.exports`):
+     https://frida.re/docs/javascript-api/
+   - Tài liệu Modes of Operation (`Spawn`, `frida-server`, `frida-gadget`):
+     https://frida.re/docs/modes/ và https://frida.re/docs/gadget/
+
+2. Mã nguồn Android AOSP chứng minh các Cổ phễu (Choke Points):
+   - Chứng minh `FileInputStream` / `FileOutputStream` được Google chuyển hướng
+     về `libcore.io.IoBridge.open`:
+     https://android.googlesource.com/platform/libcore/+/master/ojluni/src/main/native/FileInputStream.c
+     https://android.googlesource.com/platform/libcore/+/2496a68/luni/src/main/java/java/io/FileOutputStream.java
+     https://android.googlesource.com/platform/libcore/+/master/luni/src/main/java/libcore/io/IoBridge.java
+   - Chứng minh `File.createTempFile` và `File.createNewFile` đi qua
+     `UnixFileSystem.createFileExclusively`:
+     https://android.googlesource.com/platform/libcore/+/master/ojluni/src/main/java/java/io/File.java
+     https://android.googlesource.com/platform/libcore/+/5873edf/ojluni/src/main/java/java/io/UnixFileSystem.java
+   - Chứng minh gói `java.nio.file.Files` (Java NIO.2) đi qua
+     `sun.nio.fs.UnixChannelFactory.open`:
+     https://android.googlesource.com/platform/libcore/+/65073e8%5E/ojluni/src/main/java/sun/nio/fs/UnixChannelFactory.java
+   - Nguyên lý lưu vết tài nguyên của `CloseGuard` trong AOSP:
+     https://cs.android.com/android/platform/superproject/main/+/main:libcore/dalvik/src/main/java/dalvik/system/CloseGuard.java
+
+3. Tài liệu Android Developers về Hành vi API gây rò rỉ:
+   - `java.io.File#delete()` trả về `false` thay vì ném `IOException`:
+     https://developer.android.com/reference/java/io/File#delete()
+   - Cơ chế cờ `IS_PENDING` trên Scoped Storage (`MediaStore`):
+     https://developer.android.com/training/data-storage/shared/media#toggle-pending-status
+================================================================================
