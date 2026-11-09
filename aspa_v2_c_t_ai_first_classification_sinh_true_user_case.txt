@@ -1,0 +1,487 @@
+# TÀI LIỆU 07: ĐẶC TẢ KIẾN TRÚC AI-FIRST CLASSIFICATION (4 MỨC) & BỘ SINH TRUE USER CASE TỪ HÀNH TRÌNH GIAO DIỆN
+(Dùng để đưa cho AI triển khai/nâng cấp các file: `ai_verifier/ui_context_resolver.py`, `ai_verifier/prompt_templates.py`, `ai_verifier/batch_triage.py`, `ai_verifier/gemini_cli.py`, `core/store.py`, và `reporters/html_reporter.py`)
+
+Hãy đóng vai Principal Android Performance & AI-for-SE Architect. Hãy nâng cấp hệ thống `android_perf_analyzer` theo đúng đặc tả kỹ thuật dưới đây để giải quyết triệt để 2 mục tiêu:
+1. **AI-First Issue Classification**: Static Analysis chỉ đóng vai trò thu thập "Hồ sơ Sự thật Cấu trúc" (`StructuralFactSheet`) và gom cụm không trùng lặp; **Gemini CLI nắm toàn quyền quyết định phân loại** từng Call Flow vào 4 nhóm: `ACTUAL_ISSUE`, `WARNING`, `INFO`, hoặc `FALSE_POSITIVE` thông qua cơ chế 2 vòng (Vòng 1 chạy theo lô 15 flows/lần gọi để duyệt hết 100% các cụm Call Flow độc lập; Vòng 2 mổ xẻ sâu các `ACTUAL_ISSUE`).
+2. **True End-User Case Generation**: Khắc phục tình trạng sinh Test Case mang nặng tính kỹ thuật code. Hệ thống tự động truy ngược từ `Hop 0` lên các màn hình cha (`Activity` / `Fragment` / `Dialog` / `NavGraph`) và giải mã trực tiếp `res/values*/strings.xml` + `res/layout*/*.xml` để AI viết ra **User Case (Câu chuyện & Hành trình sử dụng thực tế của người dùng cuối)** hoàn toàn không chứa thuật ngữ lập trình.
+
+================================================================================
+## 1. PHÂN VAI MỚI GIỮA STATIC ENGINE VÀ GEMINI CLI (AI-FIRST WORKFLOW)
+================================================================================
+
+### 1.1. Vai trò của Static Engine (`core/pareto_ranker.py` & `core/summary_engine.py`)
+- **KHÔNG** tự ý cắt ngưỡng điểm số cứng để loại bỏ các lỗi tiềm năng trước khi AI nhìn thấy.
+- Từ Call Graph đã vá bằng SvACE Bytecode, liệt kê toàn bộ các Call Flow xuất phát từ `UI Entry Point` có chạm tới Sink, hoặc có vòng lặp động $D(\pi) \ge 1$, hoặc có tranh chấp khóa `synchronized`.
+- Thực hiện **Gom cụm theo Điểm cuối (`Endpoint Canonicalization`)**: Gom tất cả các đường đi có cùng `(culprit_node_fqn, primary_sink_or_loop_type)` thành **1 Call Flow đại diện ngắn nhất** (ghi nhận tổng số đường gọi từ UI vào `cluster_clone_count`).
+- Tạo một **`StructuralFactSheet`** (Phiếu Sự thật Cấu trúc khách quan, không có trọng số giả định) cho mỗi Call Flow độc lập:
+  - `flow_id`: Mã định danh (VD: `CF-001`)
+  - `ui_entry_phase`: `"RENDER_EVERY_FRAME_8MS"` | `"LIFECYCLE_TRANSITION"` | `"USER_CLICK_INTERACTION"` | `"CONDITIONAL_CALLBACK"`
+  - `hop_count`: Số bước nhảy từ UI Root tới hàm thủ phạm
+  - `asymptotic_loop_order`: Chuỗi biểu diễn bậc vòng lặp đếm từ AST (`"O(1)"`, `"O(N)"`, `"O(N^2)"`, `"O(N^3)"`)
+  - `loop_headers_chain`: Danh sách nguyên văn các dòng tiêu đề vòng lặp đi qua trên đường gọi
+  - `terminal_operations`: Danh sách các API Sink hoặc thao tác đắt đỏ tại nút cuối
+  - `path_guards`: Danh sách nguyên văn các điều kiện `if (...)` / `when (...)` bao quanh lời gọi dọc đường đi
+  - `has_early_return_guard`: `True/False`
+  - `lock_contention_info`: Thông tin khóa `synchronized` / `by lazy` bị giữ chéo luồng (nếu có)
+  - `build_scope`: `"BUILT"` hoặc `"NOT_IN_BUILD"`
+
+### 1.2. Vai trò của Gemini CLI qua 2 Vòng Phân loại (`ai_verifier/`)
+- **Vòng 1 — Phân loại Toàn diện theo Lô (`BatchAIClassifier` - 15 Call Flows / 1 Prompt)**:
+  - Nhận toàn bộ các cụm Call Flow độc lập từ Đường biên Pareto (ví dụ 60 - 120 cụm, chia thành các lô 15 cụm).
+  - Với mỗi cụm, đọc `StructuralFactSheet` + 15 dòng code tâm điểm tại hàm thủ phạm.
+  - Gemini CLI trực tiếp quyết định nhãn phân loại cho từng Call Flow vào đúng 1 trong 4 mức:
+    1. **`ACTUAL_ISSUE`**: Chạy trên Main Thread (`BUILT`), không có cache $O(1)$ chặn trước, thực hiện I/O / IPC / Decode Bitmap / Khóa chéo luồng hoặc lặp trên tập dữ liệu người dùng có thể phình to ($N \ge 20$), gây rớt khung hình hoặc ANR thực sự.
+    2. **`WARNING`**: Có tác vụ nặng trên Main Thread nhưng (a) đã có biến cờ/cache chặn nên chỉ chạy 1 lần lúc khởi tạo (Cold one-off), HOẶC (b) kích thước dữ liệu lặp thông thường nhỏ ($5 \text{--} 10$ phần tử), chỉ giật ở kịch bản dữ liệu cực đoan, HOẶC (c) cần xác nhận thêm `Handler` lúc chạy thật.
+    3. **`INFO`**: Chỉ là Code Smell nhẹ (tạo list trung gian `.filter{}.map{}`, gọi hàm nhẹ trong sự kiện đơn lẻ), tốn $< 2\text{ms}$, không gây ảnh hưởng trải nghiệm người dùng.
+    4. **`FALSE_POSITIVE`**: Đã chạy trên Background Thread (`Dispatchers.IO/Default`, `Executor`, `backgroundHandler`), vòng lặp hằng số cực nhỏ ($\le 4$ phần tử) không có I/O, nhánh code chết, hoặc `NOT_IN_BUILD`.
+- **Vòng 2 — Giải phẫu Chuyên sâu & Sinh True User Case (`DeepUserCaseAndFixSynthesizer`)**:
+  - Chạy tự động trên tất cả các Call Flow được Vòng 1 phân loại là **`ACTUAL_ISSUE`** (và các **`WARNING`** đứng đầu nếu còn hạn ngạch `--top-k`).
+  - Kết hợp **Spine Slicer (250 dòng)** + **Bộ Giải mã Hành trình Giao diện (`UIContextAndNavigationResolver`)** để Gemini CLI xác nhận lần cuối, viết bản vá code đa tầng (`refactoring_diff_suggestion`) và sinh **True User Case (`qa_user_case`)**.
+
+================================================================================
+## 2. MÃ NGUỒN ĐẦY ĐỦ: BỘ GIẢI MÃ HÀNH TRÌNH GIAO DIỆN (`ai_verifier/ui_context_resolver.py`)
+================================================================================
+Hãy tạo file mới `ai_verifier/ui_context_resolver.py` để tự động bắc cầu từ `Hop 0` (ví dụ một `Adapter` hoặc `CustomView`) ngược lên cây màn hình (`Fragment` / `Activity` / `Navigation Graph`) và dịch các mã `R.string.*`, `R.id.*`, `R.layout.*` thành **chữ hiển thị thật trên màn hình điện thoại**:
+
+```python
+"""
+ai_verifier/ui_context_resolver.py
+Bộ giải mã ngữ cảnh giao diện người dùng (UI Context & Navigation Breadcrumb Resolver):
+1. Đọc res/values*/strings.xml để dịch @string/xxx và R.string.xxx sang chữ thật trên màn hình.
+2. Đọc res/layout*/*.xml để dịch R.id.xxx và biến ViewBinding sang loại nút bấm/danh sách + nhãn chữ.
+3. Đọc res/navigation/*.xml và truy ngược đồ thị SQLite từ Hop 0 lên các Activity/Fragment/Dialog cha
+   để dựng Hành trình Điều hướng Màn hình (Upstream User Navigation Journey).
+"""
+
+import re
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+
+class UIContextAndNavigationResolver:
+    UI_CONTAINER_SUFFIXES = (
+        "Activity", "Fragment", "Dialog", "BottomSheet", "Screen",
+        "Page", "View", "Controller", "Host", "Sheet"
+    )
+
+    def __init__(self, repo_root: str, store: Any, symbol_table: Optional[Any] = None):
+        self.repo_root = Path(repo_root)
+        self.store = store
+        self.symbol_table = symbol_table
+        self.string_map: Dict[str, str] = {}
+        self.layout_views_map: Dict[str, List[Dict[str, str]]] = {}
+        self.view_id_lookup: Dict[str, List[str]] = {}
+        self.nav_graph_titles: Dict[str, str] = {}
+        self._index_all_android_resources()
+
+    def _index_all_android_resources(self) -> None:
+        if not self.repo_root.exists():
+            return
+
+        # 1. Index toàn bộ strings.xml (ưu tiên giữ cả tiếng Việt và tiếng Anh nếu có)
+        for xml_path in self.repo_root.rglob("res/values*/strings.xml"):
+            try:
+                tree = ET.parse(xml_path)
+                for elem in tree.getroot().findall("string"):
+                    name = elem.attrib.get("name")
+                    text = "".join(elem.itertext()).strip()
+                    if name and text and not text.startswith("@string/"):
+                        if name in self.string_map and text not in self.string_map[name]:
+                            if len(self.string_map[name]) < 80:
+                                self.string_map[name] = f"{self.string_map[name]} / {text}"
+                        else:
+                            self.string_map[name] = text
+            except Exception:
+                continue
+
+        # 2. Index các file res/layout*/*.xml để biết mỗi View ID là thành phần gì, hiển thị chữ gì
+        android_ns = "{http://schemas.android.com/apk/res/android}"
+        app_ns_candidates = [
+            "{http://schemas.android.com/apk/res-auto}",
+            android_ns,
+        ]
+
+        for layout_path in self.repo_root.rglob("res/layout*/*.xml"):
+            layout_name = layout_path.stem
+            try:
+                tree = ET.parse(layout_path)
+                for elem in tree.getroot().iter():
+                    raw_id = elem.attrib.get(f"{android_ns}id", "")
+                    view_id = raw_id.split("/")[-1] if "/" in raw_id else ""
+                    view_tag = elem.tag.split(".")[-1]
+
+                    # Tìm nhãn chữ từ text, title, hint, contentDescription
+                    label_candidates = []
+                    for attr_name in ("text", "title", "hint", "contentDescription", "label"):
+                        for ns in app_ns_candidates:
+                            val = elem.attrib.get(f"{ns}{attr_name}")
+                            if val:
+                                resolved = self._resolve_string_ref(val)
+                                if resolved and resolved not in label_candidates:
+                                    label_candidates.append(resolved)
+
+                    label_str = " | ".join(label_candidates)
+                    if view_id or label_str:
+                        entry = {
+                            "layout": layout_name,
+                            "view_id": view_id or "(unnamed)",
+                            "view_type": view_tag,
+                            "screen_text": label_str,
+                        }
+                        self.layout_views_map.setdefault(layout_name, []).append(entry)
+                        if view_id:
+                            desc = f"Nút/Khung `{view_id}` ({view_tag} trong `{layout_name}.xml`)"
+                            if label_str:
+                                desc += f' -> Chữ trên màn hình: "{label_str}"'
+                            self.view_id_lookup.setdefault(view_id, []).append(desc)
+            except Exception:
+                continue
+
+        # 3. Index res/navigation/*.xml để biết tiêu đề màn hình Fragment/Activity
+        for nav_path in self.repo_root.rglob("res/navigation*/*.xml"):
+            try:
+                tree = ET.parse(nav_path)
+                for elem in tree.getroot().iter():
+                    cls_name = elem.attrib.get(f"{android_ns}name", "")
+                    raw_label = elem.attrib.get(f"{android_ns}label", "")
+                    if cls_name and raw_label:
+                        short_cls = cls_name.split(".")[-1]
+                        self.nav_graph_titles[short_cls] = self._resolve_string_ref(raw_label)
+            except Exception:
+                continue
+
+    def _resolve_string_ref(self, raw_val: str) -> str:
+        raw_val = raw_val.strip()
+        if raw_val.startswith("@string/"):
+            key = raw_val.split("/", 1)[1]
+            return self.string_map.get(key, raw_val)
+        return raw_val
+
+    def trace_upstream_screen_hierarchy(self, root_fqn: str, max_depth: int = 4) -> List[str]:
+        """
+        Truy ngược từ Hop 0 (ví dụ Adapter.onBindViewHolder hoặc View.onDraw)
+        lên các hàm/class cha (Fragment, Activity, Dialog, Screen) để biết người dùng
+        phải đi qua những màn hình nào mới tới được tính năng này.
+        """
+        breadcrumbs: List[str] = []
+        visited: Set[str] = {root_fqn}
+        current_frontier: List[str] = [root_fqn]
+
+        cur = self.store.conn.cursor()
+        for _ in range(max_depth):
+            if not current_frontier:
+                break
+            placeholders = ",".join("?" for _ in current_frontier)
+            rows = cur.execute(
+                f"SELECT DISTINCT caller_fqn FROM call_edges WHERE callee_fqn IN ({placeholders}) LIMIT 25",
+                tuple(current_frontier),
+            ).fetchall()
+
+            next_frontier: List[str] = []
+            for r in rows:
+                caller = r[0]
+                if caller and caller not in visited:
+                    visited.add(caller)
+                    next_frontier.append(caller)
+                    cls_part = caller.split("/")[0].rsplit(".", 1)[0]
+                    short_cls = cls_part.split(".")[-1]
+                    if any(short_cls.endswith(sfx) for sfx in self.UI_CONTAINER_SUFFIXES):
+                        nav_title = self.nav_graph_titles.get(short_cls)
+                        tag = f"{short_cls} ('{nav_title}')" if nav_title else short_cls
+                        if tag not in breadcrumbs:
+                            breadcrumbs.append(tag)
+            current_frontier = next_frontier
+
+        # Bổ sung chính class của Hop 0 vào cuối hành trình
+        root_cls = root_fqn.split("/")[0].rsplit(".", 1)[0].split(".")[-1]
+        root_title = self.nav_graph_titles.get(root_cls)
+        root_tag = f"{root_cls} ('{root_title}')" if root_title else root_cls
+        breadcrumbs.reverse()
+        if not breadcrumbs or breadcrumbs[-1] != root_tag:
+            breadcrumbs.append(root_tag)
+        return breadcrumbs
+
+    def extract_rich_user_context(self, hp: Any, code_slice: str) -> Dict[str, Any]:
+        """
+        Trích xuất trọn bộ hồ sơ Ngữ cảnh Người dùng (Hành trình màn hình + Chữ hiển thị thật + Điều kiện nghiệp vụ)
+        để cung cấp cho Gemini CLI sinh True User Case.
+        """
+        breadcrumbs = self.trace_upstream_screen_hierarchy(hp.root_fqn)
+
+        # 1. Tìm tất cả R.layout.* hoặc tên *Binding xuất hiện trong lát cắt code
+        layouts_found: Set[str] = set(re.findall(r"R\.layout\.([a-zA-Z0-9_]+)", code_slice))
+        for binding_cls in re.findall(r"([A-Z][a-zA-Z0-9]+)Binding", code_slice):
+            snake_layout = re.sub(r"(?<!^)(?=[A-Z])", "_", binding_cls).lower()
+            if snake_layout.endswith("_binding"):
+                snake_layout = snake_layout[:-8]
+            layouts_found.add(snake_layout)
+
+        # 2. Tìm tất cả R.id.* và biến binding.<viewName>
+        view_ids_found: Set[str] = set(re.findall(r"R\.id\.([a-zA-Z0-9_]+)", code_slice))
+        for camel_view in re.findall(r"binding\.([a-zA-Z0-9]+)", code_slice):
+            snake_id = re.sub(r"(?<!^)(?=[A-Z])", "_", camel_view).lower()
+            view_ids_found.add(snake_id)
+
+        resolved_ui_elements: List[str] = []
+        for vid in sorted(view_ids_found):
+            if vid in self.view_id_lookup:
+                resolved_ui_elements.extend(self.view_id_lookup[vid][:2])
+
+        for layout_name in sorted(layouts_found):
+            for entry in self.layout_views_map.get(layout_name, [])[:6]:
+                if entry["screen_text"]:
+                    item_str = (
+                        f"Màn hình/Khung `{layout_name}.xml` có {entry['view_type']} "
+                        f"(`{entry['view_id']}`) hiển thị chữ: \"{entry['screen_text']}\""
+                    )
+                    if item_str not in resolved_ui_elements:
+                        resolved_ui_elements.append(item_str)
+
+        # 3. Tìm tất cả R.string.* trực tiếp trong code
+        resolved_strings: List[str] = []
+        for s_key in sorted(set(re.findall(r"R\.string\.([a-zA-Z0-9_]+)", code_slice))):
+            if s_key in self.string_map:
+                resolved_strings.append(f'"{self.string_map[s_key]}" (từ R.string.{s_key})')
+
+        # 4. Trích xuất các câu lệnh điều kiện if / when dọc theo lát cắt code
+        guard_lines: List[str] = []
+        for line in code_slice.splitlines():
+            stripped = line.strip()
+            if re.search(r"\b(if|when)\s*\(", stripped):
+                guard_lines.append(stripped)
+
+        return {
+            "navigation_breadcrumbs": " -> ".join(breadcrumbs),
+            "resolved_ui_elements": resolved_ui_elements[:12],
+            "resolved_screen_strings": resolved_strings[:10],
+            "business_condition_guards": guard_lines[:10],
+        }
+```
+
+================================================================================
+## 3. CẬP NHẬT PYDANTIC SCHEMAS TRONG `ai_verifier/gemini_cli.py`
+================================================================================
+Thay thế schema cũ bằng bộ Schema hỗ trợ **Phân loại 4 mức do AI quyết định** (`ACTUAL_ISSUE`, `WARNING`, `INFO`, `FALSE_POSITIVE`) và **True User Case (`QAUserCaseSpec`)**:
+
+```python
+from typing import List, Literal, Optional
+from pydantic import BaseModel, Field
+
+IssueClassificationType = Literal["ACTUAL_ISSUE", "WARNING", "INFO", "FALSE_POSITIVE"]
+
+class BatchFlowDecision(BaseModel):
+    flow_id: str
+    classification: IssueClassificationType
+    impacted_ux_metric: Literal["FRAME_JANK", "ANR_RISK", "COLD_START_DELAY", "MEMORY_GC_CHURN", "NONE"]
+    estimated_complexity: str = Field(default="O(1)")
+    ai_reasoning: str
+    quick_fix_hint: str = Field(default="")
+
+class BatchClassificationResponse(BaseModel):
+    decisions: List[BatchFlowDecision]
+
+class HopAuditItem(BaseModel):
+    hop_index: int
+    fqn: str
+    finding: str
+
+class QAUserCaseSpec(BaseModel):
+    scenario_id: str = Field(default="UC-PERF-001")
+    user_story_title: str = Field(
+        default="",
+        description="Tiêu đề tình huống người dùng đời thường, không chứa tên hàm code"
+    )
+    user_persona_and_context: str = Field(
+        default="",
+        description="Hoàn cảnh và mục tiêu thực tế của người dùng khi sử dụng tính năng này"
+    )
+    real_world_data_preparation: List[str] = Field(
+        default_factory=list,
+        description="Dữ liệu đời thực trên máy người dùng (VD: 50 bức ảnh trong album, bật chế độ HDR...)"
+    )
+    user_navigation_and_action_steps: List[str] = Field(
+        default_factory=list,
+        description="Hành trình từng bước từ lúc mở App -> đi qua các màn hình -> thao tác (dùng tên nút/chữ thật trên UI)"
+    )
+    user_experienced_symptom: str = Field(
+        default="",
+        description="Hiện tượng giật/đơ/trễ mà mắt và ngón tay người dùng trực tiếp cảm nhận được"
+    )
+    qa_acceptance_criteria: str = Field(
+        default="",
+        description="Tiêu chí nghiệm thu trải nghiệm mượt mà cho Tester kèm chỉ số tham khảo"
+    )
+
+class DeepVerificationResult(BaseModel):
+    classification: IssueClassificationType
+    impacted_ux_metric: Literal["FRAME_JANK", "ANR_RISK", "COLD_START_DELAY", "MEMORY_GC_CHURN", "NONE"]
+    effective_time_complexity: str
+    estimated_wall_time_ms: str = Field(default="unknown")
+    decisive_node_fqn: Optional[str] = Field(default=None)
+    hop_by_hop_audit: List[HopAuditItem] = Field(default_factory=list)
+    ai_classification_reasoning: str
+    refactoring_diff_suggestion: str = Field(default="")
+    qa_user_case: Optional[QAUserCaseSpec] = Field(default=None)
+```
+
+================================================================================
+## 4. BỘ PROMPT VÒNG 1 & VÒNG 2 TRONG `ai_verifier/prompt_templates.py`
+================================================================================
+Cập nhật file `ai_verifier/prompt_templates.py` với 2 bộ Prompt cho Vòng 1 (AI Phân loại Hàng loạt 4 Mức) và Vòng 2 (AI Giải phẫu Sâu & Sinh True User Case):
+
+```python
+# ==============================================================================
+# VÒNG 1: BATCH AI CLASSIFIER (PHÂN LOẠI HÀNG LOẠT 12-15 CALL FLOWS / LẦN GỌI)
+# ==============================================================================
+BATCH_CLASSIFIER_SYSTEM_PROMPT = (
+    "Bạn là Principal Android Performance Architect. Hệ thống phân tích tĩnh cung cấp cho bạn "
+    "một lô các Chuỗi gọi hàm (Call Flows) kèm Hồ sơ Sự thật Cấu trúc (Structural Fact Sheet) và đoạn code tâm điểm. "
+    "Hệ thống tĩnh KHÔNG tự chấm điểm đúng/sai mà giao toàn quyền cho bạn đọc hiểu ngữ nghĩa code để phân loại "
+    "từng Call Flow vào đúng 1 trong 4 mức: ACTUAL_ISSUE, WARNING, INFO, hoặc FALSE_POSITIVE. "
+    "Chỉ xuất ra duy nhất 1 khối raw JSON hợp lệ theo schema, tuyệt đối không bọc trong ```json markdown."
+)
+
+BATCH_CLASSIFIER_STDIN_TEMPLATE = """# TIÊU CHÍ PHÂN LOẠI 4 MỨC DO AI QUYẾT ĐỊNH
+Hãy đọc kỹ từng Call Flow dưới đây và phân loại vào đúng 1 trong 4 nhãn:
+
+1. `"ACTUAL_ISSUE"` (Lỗi hiệu năng thật sự ảnh hưởng người dùng - Cần sửa ngay):
+   - Chạy trên Main Thread (`BUILT` scope), KHÔNG có cơ chế cache trong RAM (`LruCache`, `HashMap`, cờ `isLoaded`) chặn O(1) ở đầu hàm.
+   - Thực hiện Disk I/O, Database query, Binder IPC, giải mã Bitmap, giữ khóa `synchronized` tranh chấp với Background Thread, HOẶC chạy vòng lặp trên tập dữ liệu động của người dùng (số phần tử thực tế có thể >= 20), làm tốn > 8.3ms trên đường vẽ/cuộn hoặc > 16.6ms - 50ms khi chuyển màn hình/bấm nút.
+
+2. `"WARNING"` (Cảnh báo nguy cơ tiềm ẩn hoặc chỉ xảy ra ở điều kiện biên):
+   - Có gọi tác vụ nặng hoặc vòng lặp trên Main Thread NHƯNG:
+     (a) Đã có biến cờ/cache chặn nên chỉ tốn thời gian ở lần khởi tạo đầu tiên (One-off cold cost), các lần gọi sau là O(1); HOẶC
+     (b) Tập dữ liệu trong vòng lặp thông thường nhỏ (5-12 phần tử), chỉ gây giật khi người dùng có dữ liệu lớn bất thường; HOẶC
+     (c) Cần kiểm tra thêm lúc chạy thật để xác nhận `Handler`/`Dispatcher` truyền từ bên ngoài.
+
+3. `"INFO"` (Code Smell nhẹ / Tối ưu hóa vi mô):
+   - Code viết chưa tối ưu (VD: dùng `.filter{}.map{}` tạo list trung gian thay vì `asSequence()`, biên dịch Regex nhỏ hoặc nối chuỗi trong hàm sự kiện đơn lẻ `onClick`), nhưng tổng thời gian chạy ước tính < 2ms, không làm rớt khung hình.
+
+4. `"FALSE_POSITIVE"` (An toàn / Cảnh báo giả):
+   - Đã chạy trên Background Thread (`withContext(Dispatchers.IO/Default)`, `Executor`, `backgroundHandler`).
+   - Vòng lặp hằng số cực nhỏ (<= 4 phần tử cố định) và không gọi I/O hay IPC.
+   - Điều kiện `if` giữa hàm cha và hàm con mâu thuẫn nhau (Dead branch) hoặc thuộc `NOT_IN_BUILD`.
+
+# DANH SÁCH CÁC CALL FLOWS TRONG LÔ CẦN PHÂN LOẠI
+{batch_flows_digest_payload}
+
+# ĐỊNH DẠNG ĐẦU RA BẮT BUỘC (STRICT RAW JSON)
+{{
+  "decisions": [
+    {{
+      "flow_id": "CF-001",
+      "classification": "ACTUAL_ISSUE | WARNING | INFO | FALSE_POSITIVE",
+      "impacted_ux_metric": "FRAME_JANK | ANR_RISK | COLD_START_DELAY | MEMORY_GC_CHURN | NONE",
+      "estimated_complexity": "VD: O(N^2) hoặc O(1) cached",
+      "ai_reasoning": "Giải thích rõ 1-2 câu dựa vào tên biến, vòng lặp, điều kiện if/cache trong code",
+      "quick_fix_hint": "Hướng tối ưu ngắn gọn 1 câu (để rỗng nếu FALSE_POSITIVE)"
+    }}
+  ]
+}}
+"""
+
+# ==============================================================================
+# VÒNG 2: DEEP AUDITOR & TRUE USER CASE GENERATOR (CHẠY CHO ACTUAL_ISSUE & TOP WARNING)
+# ==============================================================================
+DEEP_USER_CASE_SYSTEM_PROMPT = (
+    "Bạn là Principal Android Performance Architect kiêm Product UX & QA Lead. "
+    "Nhiệm vụ của bạn là phân tích sâu một Call Flow đã bị nghi ngờ gây chậm trên Main Thread, "
+    "chốt phân loại cuối cùng (ACTUAL_ISSUE / WARNING / INFO / FALSE_POSITIVE), viết bản vá code đa tầng "
+    "(refactoring_diff_suggestion), và quan trọng nhất: đóng vai người dùng cuối để viết ra một "
+    "TRUE USER CASE (Tình huống và Hành trình sử dụng thực tế của người dùng trên ứng dụng) trong trường qa_user_case. "
+    "Chỉ xuất ra duy nhất 1 khối raw JSON hợp lệ, không dùng markdown ```json."
+)
+
+DEEP_USER_CASE_STDIN_TEMPLATE = """# PHẦN 1: HỒ SƠ SỰ THẬT CẤU TRÚC CỦA CALL FLOW (STRUCTURAL FACT SHEET)
+- Mã Call Flow: `{flow_id}` (Ảnh hưởng `{cluster_clone_count}` đường gọi từ giao diện)
+- Điểm khởi phát (Hop 0): `{root_fqn}` (Pha giao diện: `{ui_entry_phase}`)
+- Độ phức tạp vòng lặp phát hiện: `{asymptotic_loop_order}` | Số bước nhảy: `{hop_count}`
+- Tác vụ nặng ở nút cuối (Terminal Sinks/Ops): `{terminal_operations}`
+- Cảnh báo tranh chấp khóa đa luồng: `{lock_contention_info}`
+
+# PHẦN 2: HÀNH TRÌNH MÀN HÌNH & CHỮ HIỂN THỊ THỰC TẾ TRÊN ĐIỆN THOẠI (RESOLVED UI & STRINGS CONTEXT)
+- Chuỗi Màn hình Điều hướng từ ngoài vào (Upstream Screen Hierarchy):
+  `{navigation_breadcrumbs}`
+- Các Nút bấm / Danh sách / Khung nhìn và Chữ hiển thị thực tế trên màn hình (từ `layout/*.xml` & `strings.xml`):
+{resolved_ui_elements_bullet_list}
+- Các Chuỗi Văn bản Giao diện liên quan:
+{resolved_screen_strings_bullet_list}
+- Các Điều kiện Rẽ nhánh Nghiệp vụ (`if / when` guards dọc theo đường đi):
+{business_condition_guards_bullet_list}
+
+# PHẦN 3: BẢN ĐỒ ĐƯỜNG ĐI TỪNG BƯỚC (HOP-BY-HOP TOPOLOGY)
+{hop_by_hop_topology_table}
+
+# PHẦN 4: LÁT CẮT MÃ NGUỒN XƯƠNG SỐNG (SANITIZED SPINE SLICE)
+{sanitized_code_slice}
+
+# PHẦN 5: QUY TẮC BẮT BUỘC KHI SINH `qa_user_case` (PHẢI LÀ TRUE USER CASE ĐỜI THỰC!)
+Nếu `classification` là `"ACTUAL_ISSUE"` hoặc `"WARNING"`, bạn phải viết trường `qa_user_case` sao cho một **Người dùng cuối hoặc Manual Tester không hề biết lập trình** đọc vào là hiểu ngay tình huống sử dụng thực tế:
+
+1. **CẤM TUYỆT ĐỐI ngôn ngữ lập trình trong `qa_user_case`**:
+   - KHÔNG ĐƯỢC nhắc đến tên hàm (`onBindViewHolder`, `onCreate`, `loadData`), tên class (`Adapter`, `Repository`, `ViewModel`), tên biến code, hay thuật ngữ như `O(N^2)`, `Binder IPC`, `Main Thread` trong các trường `user_story_title`, `user_persona_and_context`, `real_world_data_preparation`, `user_navigation_and_action_steps`, và `user_experienced_symptom`.
+   - Phải dịch toàn bộ sang **Tên màn hình, Tên tính năng và Nhãn chữ thật trên nút bấm** lấy từ PHẦN 2 ở trên!
+
+2. **Xây dựng Tình huống Người dùng có Mục đích Thực tế (`user_persona_and_context` & `real_world_data_preparation`)**:
+   - Đặt câu hỏi: *"Ngoài đời thực, người dùng đang muốn làm việc gì trên ứng dụng này khi họ đi qua luồng này?"*
+   - Ví dụ: Thay vì viết *"Chuẩn bị danh sách 50 phần tử để lặp"*, hãy viết: *"Người dùng vừa chụp khoảng 40 - 50 bức ảnh trong một buổi tiệc và muốn mở bộ sưu tập để chọn lọc, áp dụng bộ lọc màu hoặc chia sẻ hàng loạt"*.
+   - Dịch các câu lệnh `if / when` ở PHẦN 2 thành thói quen/cài đặt của người dùng: Ví dụ code có `if (isHdrAuto && isWatermarkOn)` -> viết: *"Người dùng đang bật chế độ chụp HDR Tự động và bật tính năng Đóng dấu ngày chụp lên ảnh trong phần Cài đặt"*.
+
+3. **Dẫn dắt Hành trình từ Màn hình Chính (`user_navigation_and_action_steps`)**:
+   - Dựa vào `Upstream Screen Hierarchy` ở PHẦN 2, viết các bước tuần tự từ lúc người dùng mở ứng dụng ở màn hình chính -> bấm vào tab/mục nào -> mở khay/hộp thoại nào -> thực hiện thao tác vuốt/bấm/nhập liệu ra sao.
+   - Nếu là lỗi Tranh chấp khóa (`CROSS_THREAD_LOCK_CONTENTION`): Hãy mô tả tình huống người dùng vừa bấm một tác vụ nặng đang xử lý (như vừa bấm chụp ảnh ban đêm / lưu video dài) vừa lập tức bấm chuyển chế độ hoặc mở cài đặt ngay lập tức.
+
+4. **Mô tả Triệu chứng bằng Cảm giác Mắt nhìn & Tay chạm (`user_perceived_symptom`)**:
+   - Mô tả đúng những gì người dùng phàn nàn: *"Khi dùng ngón tay vuốt dải bộ lọc màu, hình ảnh bị khựng lại khoảng nửa giây rồi mới nhảy cóc sang vị trí mới, cảm giác vuốt rất rít và trễ tay"*, hoặc *"Sau khi nhấn nút 'Lưu', nút bấm bị lún xuống và toàn bộ màn hình đứng im trong 2-3 giây không phản hồi trước khi chuyển trang"*.
+
+# PHẦN 6: ĐỊNH DẠNG ĐẦU RA BẮT BUỘC (STRICT RAW JSON SCHEMA)
+{{
+  "classification": "ACTUAL_ISSUE | WARNING | INFO | FALSE_POSITIVE",
+  "impacted_ux_metric": "FRAME_JANK | ANR_RISK | COLD_START_DELAY | MEMORY_GC_CHURN | NONE",
+  "effective_time_complexity": "VD: O(N * M) hoặc O(1)",
+  "estimated_wall_time_ms": "VD: '25ms - 70ms per scroll frame'",
+  "decisive_node_fqn": "pkg.Class.method/arity",
+  "hop_by_hop_audit": [
+    {{
+      "hop_index": 0,
+      "fqn": "pkg.Class.method/arity",
+      "finding": "Nhận xét kỹ thuật ngắn gọn cho Developer tại bước này"
+    }}
+  ],
+  "ai_classification_reasoning": "Lập luận kỹ thuật dành cho Developer giải thích tại sao phân loại là ACTUAL_ISSUE / WARNING / INFO / FALSE_POSITIVE",
+  "refactoring_diff_suggestion": "Đoạn code diff hoặc Kotlin/Java tối ưu hóa đa tầng cho Developer (để rỗng nếu FALSE_POSITIVE)",
+  "qa_user_case": {{
+    "scenario_id": "UC-PERF-001",
+    "user_story_title": "Câu chuyện người dùng ngắn gọn, tự nhiên (không có từ khóa code)",
+    "user_persona_and_context": "Bối cảnh và mục tiêu thực tế của người dùng cuối khi thực hiện hành động này",
+    "real_world_data_preparation": [
+      "Tình trạng dữ liệu và cài đặt thực tế trên máy người dùng (dịch từ điều kiện if/when và biến vòng lặp)"
+    ],
+    "user_navigation_and_action_steps": [
+      "Bước 1 (Mở màn hình chính): ...",
+      "Bước 2 (Đi vào tính năng): ...",
+      "Bước 3 (Thao tác sử dụng thực tế): ..."
+    ],
+    "user_perceived_symptom": "Hiện tượng khựng, giật, đơ hoặc trễ phản hồi mà người dùng trực tiếp nhìn thấy và cảm nhận",
+    "qa_acceptance_criteria": "Trải nghiệm mượt mà mong đợi sau khi sửa lỗi (kèm gợi ý kiểm tra nhanh cho QA)"
+  }}
+}}
+"""
+```
+
+================================================================================
+## 5. CẬP NHẬT `reporters/html_reporter.py` & KIỂM THỬ (`tests/test_ai_classification_and_user_case.py`)
+================================================================================
+1. **Trong `reporters/html_reporter.py`**:
+   - Phân nhóm các thẻ hiển thị trên báo cáo HTML trực tiếp theo phán quyết `classification` của AI:
+     * Tab / Nhóm 1 (Màu Đỏ): **`ACTUAL ISSUES (Confirmed User-Impacting Bottlenecks)`**
+     * Tab / Nhóm 2 (Màu Cam): **`WARNINGS (Conditional / One-Off / Edge-Case Risks)`**
+     * Tab / Nhóm 3 (Màu Xanh dương): **`INFO (Minor Code Smells)`**
+     * Tab / Nhóm 4 (Màu Xanh lá): **`VERIFIED SAFE / FALSE POSITIVES`**
+   - Trên mỗi thẻ `ACTUAL_ISSUE` và `WARNING`, tách riêng 2 khung:
+     * **Khung trái (Dành cho Developer)**: Sơ đồ Mermaid Call Flow, Bảng `hop_by_hop_audit`, Lập luận kỹ thuật `ai_classification_reasoning`, và Bản vá `refactoring_diff_suggestion`.
+     * **Khung phải (Dành cho QA / Product — "End-User Case & Journey")**: Hiển thị `user_story_title`, `user_persona_and_context`, `real_world_data_preparation`, `user_navigation_and_action_steps`, `user_perceived_symptom` và `qa_acceptance_criteria`.
+2. **Trong `tests/test_ai_classification_and_user_case.py`**:
+   - Viết unit test kiểm tra `UIContextAndNavigationResolver`: Tạo thư mục giả lập có `res/values/strings.xml` (`<string name="btn_apply_filter">Áp dụng bộ lọc</string>`), `res/layout/fragment_camera.xml` (nút `android:id="@+id/btn_apply"` gắn `@string/btn_apply_filter`), và chuỗi gọi `CameraActivity.onResume -> CameraFragment.openFilter -> FilterAdapter.onBindViewHolder`.
+   - Kiểm tra `extract_rich_user_context()` trả về đúng chuỗi hành trình `"CameraActivity -> CameraFragment -> FilterAdapter"` và giải mã đúng chữ `"Áp dụng bộ lọc"` để đưa vào Prompt sinh User Case.
